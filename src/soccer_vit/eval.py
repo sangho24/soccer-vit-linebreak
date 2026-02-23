@@ -208,6 +208,20 @@ def _safe_ratio(a: float | None, b: float | None) -> float | None:
     return float(a / b)
 
 
+def _resolve_explainability_export_n(cfg: dict[str, Any], n_vis_samples: int, total_n: int) -> int:
+    eval_cfg = cfg.get("eval", {})
+    raw = eval_cfg.get("explainability_export_n")
+    if raw is None:
+        raw = eval_cfg.get("explainability_export_n_samples")
+    if raw is None:
+        raw = n_vis_samples
+    try:
+        n = int(raw)
+    except Exception:
+        n = int(n_vis_samples)
+    return max(0, min(int(total_n), n))
+
+
 def _focus_features_from_patch_heat(
     heat: np.ndarray,
     y_label: int,
@@ -371,9 +385,11 @@ def _generate_resnet18_focus_summary(
     model.load_state_dict(ckpt["state_dict"], strict=False)
     model.eval()
 
-    n_samples = int(cfg.get("eval", {}).get("n_rollout_samples", 30))
-    n_samples = min(n_samples, len(X_img_test))
-    if n_samples <= 0:
+    n_vis_samples = int(cfg.get("eval", {}).get("n_rollout_samples", 30))
+    n_vis_samples = min(n_vis_samples, len(X_img_test))
+    n_export_samples = _resolve_explainability_export_n(cfg, n_vis_samples=n_vis_samples, total_n=len(X_img_test))
+    n_proc_samples = max(n_vis_samples, n_export_samples)
+    if n_proc_samples <= 0:
         return {"status": "no_samples"}
 
     patch_size = 16
@@ -384,7 +400,7 @@ def _generate_resnet18_focus_summary(
     heat_sample_ids: list[str] = []
     heat_labels: list[int] = []
     heat_meta: list[dict[str, float]] = []
-    for i in range(n_samples):
+    for i in range(n_proc_samples):
         xb = torch.tensor(X_img_test[i : i + 1], dtype=torch.float32, requires_grad=True)
         logits = model(xb)
         if logits.ndim == 2 and logits.shape[1] == 2:
@@ -406,7 +422,8 @@ def _generate_resnet18_focus_summary(
         gh, gw = grid_hw
         heat_patch = heat_big[: gh * patch_size, : gw * patch_size].reshape(gh, patch_size, gw, patch_size).mean(axis=(1, 3))
         row = meta_test.iloc[i]
-        focus_rows.append(_focus_features_from_patch_heat(heat_patch, int(y_test[i]), row, grid_hw, patch_size, cfg, rs))
+        if i < n_vis_samples:
+            focus_rows.append(_focus_features_from_patch_heat(heat_patch, int(y_test[i]), row, grid_hw, patch_size, cfg, rs))
         defenders = _parse_points(getattr(row, "defending_xy_json", ""))
         nearest_def_x = np.nan
         nearest_def_y = np.nan
@@ -419,22 +436,27 @@ def _generate_resnet18_focus_summary(
             nearest_def_x = float(defenders[idx_near, 0])
             nearest_def_y = float(defenders[idx_near, 1])
             nearest_def_d = float(d_def[idx_near])
-        heat_patches.append(heat_patch.astype(np.float32))
-        heat_sample_ids.append(str(getattr(row, "sample_id", i)))
-        heat_labels.append(int(y_test[i]))
-        heat_meta.append(
-            {
-                "passer_x_m": float(row.passer_x_m),
-                "passer_y_m": float(row.passer_y_m),
-                "receiver_x_m": float(row.receiver_x_m),
-                "receiver_y_m": float(row.receiver_y_m),
-                "nearest_def_x_m": nearest_def_x,
-                "nearest_def_y_m": nearest_def_y,
-                "nearest_def_dist_to_line_m": nearest_def_d,
-            }
-        )
+        if i < n_export_samples:
+            heat_patches.append(heat_patch.astype(np.float32))
+            heat_sample_ids.append(str(getattr(row, "sample_id", i)))
+            heat_labels.append(int(y_test[i]))
+            heat_meta.append(
+                {
+                    "passer_x_m": float(row.passer_x_m),
+                    "passer_y_m": float(row.passer_y_m),
+                    "receiver_x_m": float(row.receiver_x_m),
+                    "receiver_y_m": float(row.receiver_y_m),
+                    "nearest_def_x_m": nearest_def_x,
+                    "nearest_def_y_m": nearest_def_y,
+                    "nearest_def_dist_to_line_m": nearest_def_d,
+                }
+            )
 
-    out = {"method": "input_grad_x_input_patch_mean", "n_samples": int(n_samples)}
+    out = {
+        "method": "input_grad_x_input_patch_mean",
+        "n_samples": int(n_vis_samples),
+        "export_n_samples": int(n_export_samples),
+    }
     out["focus"] = _aggregate_focus_rows(focus_rows)
     _save_explainability_samples_npz(
         out_path=_paths(cfg)["reports"] / "resnet18_focus_samples.npz",
@@ -647,8 +669,10 @@ def _generate_vit_rollout_artifacts(
     cfg: dict[str, Any],
     out_dir: Path,
 ) -> dict[str, Any]:
-    n_samples = int(cfg.get("eval", {}).get("n_rollout_samples", 30))
-    n_samples = min(n_samples, len(X_img_test))
+    n_vis_samples = int(cfg.get("eval", {}).get("n_rollout_samples", 30))
+    n_vis_samples = min(n_vis_samples, len(X_img_test))
+    n_export_samples = _resolve_explainability_export_n(cfg, n_vis_samples=n_vis_samples, total_n=len(X_img_test))
+    n_proc_samples = max(n_vis_samples, n_export_samples)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Fallback: save channel-max heatmaps so artifact paths exist even without torch/timm.
@@ -671,11 +695,15 @@ def _generate_vit_rollout_artifacts(
 
     vit_path = _paths(cfg)["models"] / "vit_base.pt"
     if not vit_path.exists():
-        for i in range(n_samples):
+        for i in range(n_vis_samples):
             heat = X_img_test[i].max(axis=0)
             heat = (heat - heat.min()) / (heat.max() - heat.min() + 1e-8)
             _save_placeholder(i, heat, "placeholder")
-        return {"rollout_count": n_samples, "attention_distance": {"status": "vit_checkpoint_missing"}}
+        return {
+            "rollout_count": int(n_vis_samples),
+            "export_n_samples": int(n_export_samples),
+            "attention_distance": {"status": "vit_checkpoint_missing"},
+        }
 
     try:  # pragma: no cover - torch/timm dependent
         import torch
@@ -688,11 +716,15 @@ def _generate_vit_rollout_artifacts(
         )
         from .models.vit import ViTBuildConfig, create_vit_model
     except Exception:
-        for i in range(n_samples):
+        for i in range(n_vis_samples):
             heat = X_img_test[i].max(axis=0)
             heat = (heat - heat.min()) / (heat.max() - heat.min() + 1e-8)
             _save_placeholder(i, heat, "placeholder")
-        return {"rollout_count": n_samples, "attention_distance": {"status": "vit_dependencies_missing"}}
+        return {
+            "rollout_count": int(n_vis_samples),
+            "export_n_samples": int(n_export_samples),
+            "attention_distance": {"status": "vit_dependencies_missing"},
+        }
 
     ckpt = torch.load(vit_path, map_location="cpu")
     model = create_vit_model(
@@ -716,7 +748,7 @@ def _generate_vit_rollout_artifacts(
     heat_sample_ids: list[str] = []
     heat_labels: list[int] = []
     heat_meta: list[dict[str, float]] = []
-    for i in range(n_samples):
+    for i in range(n_proc_samples):
         xb = torch.tensor(X_img_test[i : i + 1], dtype=torch.float32)
         with ViTAttentionExtractor(model) as cap:
             _ = model(xb)
@@ -727,12 +759,14 @@ def _generate_vit_rollout_artifacts(
             # Upsample to raster size (nearest) without extra deps.
             heat_big = np.kron(heat, np.ones((patch_size, patch_size), dtype=np.float32))
             heat_big = heat_big[: X_img_test.shape[-2], : X_img_test.shape[-1]]
-            dist_rows.append({"label": int(y_test[i]), **attention_distance(mats, patch_size_m=patch_size_m)})
+            if i < n_vis_samples:
+                dist_rows.append({"label": int(y_test[i]), **attention_distance(mats, patch_size_m=patch_size_m)})
             # Passer/receiver/corridor/nearest-def summary on patch grid.
             if meta_test is not None and i < len(meta_test):
                 row = meta_test.iloc[i]
                 rs = _counterfactual_render_spec(cfg)
-                focus_rows.append(_focus_features_from_patch_heat(heat, int(y_test[i]), row, grid_hw, patch_size, cfg, rs))
+                if i < n_vis_samples:
+                    focus_rows.append(_focus_features_from_patch_heat(heat, int(y_test[i]), row, grid_hw, patch_size, cfg, rs))
                 defenders = _parse_points(getattr(row, "defending_xy_json", ""))
                 nearest_def_x = np.nan
                 nearest_def_y = np.nan
@@ -745,33 +779,40 @@ def _generate_vit_rollout_artifacts(
                     nearest_def_x = float(defenders[idx_near, 0])
                     nearest_def_y = float(defenders[idx_near, 1])
                     nearest_def_d = float(d_def[idx_near])
-                heat_patches.append(heat.astype(np.float32))
-                heat_sample_ids.append(str(sample_ids_test[i]))
-                heat_labels.append(int(y_test[i]))
-                heat_meta.append(
-                    {
-                        "passer_x_m": float(row.passer_x_m),
-                        "passer_y_m": float(row.passer_y_m),
-                        "receiver_x_m": float(row.receiver_x_m),
-                        "receiver_y_m": float(row.receiver_y_m),
-                        "nearest_def_x_m": nearest_def_x,
-                        "nearest_def_y_m": nearest_def_y,
-                        "nearest_def_dist_to_line_m": nearest_def_d,
-                    }
-                )
+                if i < n_export_samples:
+                    heat_patches.append(heat.astype(np.float32))
+                    heat_sample_ids.append(str(sample_ids_test[i]))
+                    heat_labels.append(int(y_test[i]))
+                    heat_meta.append(
+                        {
+                            "passer_x_m": float(row.passer_x_m),
+                            "passer_y_m": float(row.passer_y_m),
+                            "receiver_x_m": float(row.receiver_x_m),
+                            "receiver_y_m": float(row.receiver_y_m),
+                            "nearest_def_x_m": nearest_def_x,
+                            "nearest_def_y_m": nearest_def_y,
+                            "nearest_def_dist_to_line_m": nearest_def_d,
+                        }
+                    )
         else:
             heat_big = X_img_test[i].max(axis=0)
             heat_big = (heat_big - heat_big.min()) / (heat_big.max() - heat_big.min() + 1e-8)
-        _save_placeholder(i, heat_big, "rollout")
+        if i < n_vis_samples:
+            _save_placeholder(i, heat_big, "rollout")
 
     if not dist_rows:
-        return {"rollout_count": n_samples, "attention_distance": {"status": "attention_not_captured"}}
+        return {
+            "rollout_count": int(n_vis_samples),
+            "export_n_samples": int(n_export_samples),
+            "attention_distance": {"status": "attention_not_captured"},
+        }
 
     # Aggregate label-wise means and low/high perturb deltas (using prediction-time attention distance only if available).
     dists = np.array([r["attention_distance_mean"] for r in dist_rows], dtype=float)
     labs = np.array([r["label"] for r in dist_rows], dtype=int)
     out = {
-        "rollout_count": n_samples,
+        "rollout_count": int(n_vis_samples),
+        "export_n_samples": int(n_export_samples),
         "attention_distance": {
             "label0_mean": float(np.nanmean(dists[labs == 0])) if np.any(labs == 0) else None,
             "label1_mean": float(np.nanmean(dists[labs == 1])) if np.any(labs == 1) else None,

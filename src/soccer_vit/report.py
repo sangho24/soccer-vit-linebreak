@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -61,7 +62,124 @@ def _safe_float(x: Any) -> float | None:
     return v
 
 
-def _plot_q1_no_passer(metrics_map: dict[str, dict[str, Any]], out_path: Path) -> bool:
+def _safe_int(x: Any) -> int | None:
+    if x is None:
+        return None
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+def _fmt_num(x: Any, nd: int = 3) -> str:
+    v = _safe_float(x)
+    if v is None:
+        return "NA"
+    return f"{v:.{nd}f}"
+
+
+def _nan_abs_max(arr: np.ndarray | list[np.ndarray], default: float = 1.0) -> float:
+    if isinstance(arr, list):
+        vals = []
+        for a in arr:
+            aa = np.asarray(a, dtype=float)
+            if aa.size == 0:
+                continue
+            m = np.isfinite(aa)
+            if np.any(m):
+                vals.append(float(np.max(np.abs(aa[m]))))
+        return max(vals) if vals else float(default)
+    aa = np.asarray(arr, dtype=float)
+    if aa.size == 0:
+        return float(default)
+    m = np.isfinite(aa)
+    if not np.any(m):
+        return float(default)
+    return float(np.max(np.abs(aa[m])))
+
+
+def _nan_min_max(arrs: list[np.ndarray], default: tuple[float, float] = (0.0, 1.0)) -> tuple[float, float]:
+    vals = []
+    for a in arrs:
+        aa = np.asarray(a, dtype=float)
+        if aa.size == 0:
+            continue
+        m = np.isfinite(aa)
+        if np.any(m):
+            vals.append(aa[m])
+    if not vals:
+        return float(default[0]), float(default[1])
+    cat = np.concatenate(vals)
+    return float(np.min(cat)), float(np.max(cat))
+
+
+def _add_bar_value_labels(ax, bar_container, nd: int = 3, fontsize: int = 8) -> None:
+    for rect in bar_container:
+        h = float(rect.get_height())
+        if not np.isfinite(h):
+            continue
+        x = float(rect.get_x() + rect.get_width() / 2.0)
+        if h >= 0:
+            y = h + 0.015
+            va = "bottom"
+        else:
+            y = h - 0.015
+            va = "top"
+        ax.text(x, y, f"{h:.{nd}f}", ha="center", va=va, fontsize=fontsize)
+
+
+def _load_counterfactual_csv_rows(report_dir: Path, model_name: str) -> list[dict[str, Any]]:
+    path = report_dir / f"counterfactual_{model_name}.csv"
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            label_on = _safe_int(r.get("label_on_line"))
+            label_off = _safe_int(r.get("label_off_line"))
+            rows.append(
+                {
+                    "sample_id": r.get("sample_id"),
+                    "delta_on_minus_off": _safe_float(r.get("delta_on_minus_off")),
+                    "p_on_line": _safe_float(r.get("p_on_line")),
+                    "p_off_line": _safe_float(r.get("p_off_line")),
+                    "label_on_line": label_on,
+                    "label_off_line": label_off,
+                    "is_label_flip": (
+                        None if label_on is None or label_off is None else bool(label_on != label_off)
+                    ),
+                }
+            )
+    return rows
+
+
+def _mask_by_count(arr: np.ndarray, count: np.ndarray | None, min_count: float) -> np.ndarray:
+    out = np.asarray(arr, dtype=float).copy()
+    if count is not None:
+        c = np.asarray(count, dtype=float)
+        bad = (~np.isfinite(c)) | (c < float(min_count))
+        out[bad] = np.nan
+    return out
+
+
+def _draw_passcentric_guides(ax, dark_bg: bool = False) -> None:
+    line_color = "white" if dark_bg else "black"
+    # Corridor zone in normalized lateral coordinates (|v| <= 1).
+    ax.axhspan(-1.0, 1.0, color=(1, 1, 1, 0.05) if dark_bg else (0, 0, 0, 0.05), zorder=0)
+    ax.axhline(0, color=line_color, lw=0.8, alpha=0.8, zorder=2)
+    ax.axvline(0, color=line_color, lw=0.8, alpha=0.8, zorder=2)
+    ax.axvline(1, color=line_color, lw=0.8, alpha=0.8, ls="--", zorder=2)
+    ax.text(0.01, 0.98, "u=0 passer", transform=ax.transAxes, ha="left", va="top", fontsize=7, color=line_color)
+    ax.text(0.70, 0.98, "u=1 receiver", transform=ax.transAxes, ha="left", va="top", fontsize=7, color=line_color)
+    ax.text(0.01, 0.05, "v=0 pass line\n|v|<=1 corridor", transform=ax.transAxes, ha="left", va="bottom", fontsize=7, color=line_color)
+
+
+def _plot_q1_no_passer(
+    metrics_map: dict[str, dict[str, Any]],
+    out_path: Path,
+    report_dirs: dict[str, Path] | None = None,
+) -> bool:
     if not {"both", "no_passer"}.issubset(metrics_map.keys()):
         return False
     try:
@@ -78,6 +196,7 @@ def _plot_q1_no_passer(metrics_map: dict[str, dict[str, Any]], out_path: Path) -
         rows.append(
             {
                 "name": key,
+                "report_dir": str((report_dirs or {}).get(key, "")),
                 "AUROC": _safe_float(_get(orig, "auroc")),
                 "F1": _safe_float(_get(orig, "f1")),
                 "CF rate": _safe_float(cf.get("on_line_greater_rate")),
@@ -85,39 +204,98 @@ def _plot_q1_no_passer(metrics_map: dict[str, dict[str, Any]], out_path: Path) -
                 "Receiver-Passer": _safe_float(rf.get("receiver_minus_passer_mean")),
                 "Corridor/Passer": _safe_float(rf.get("corridor_to_passer_ratio")),
                 "NearestDef/Passer": _safe_float(rf.get("nearest_defender_to_passer_ratio")),
+                "passer_mean": _safe_float(rf.get("passer_mean")),
+                "receiver_mean": _safe_float(rf.get("receiver_mean")),
+                "corridor_mean": _safe_float(rf.get("corridor_mean")),
+                "nearest_defender_mean": _safe_float(rf.get("nearest_defender_mean")),
+                "eval_n_test": _safe_int(_get(m, "conditions", "eval_n_test")),
+                "cf_n": _safe_int(_get(m, "counterfactual", "vit_base", "n")),
+                "rollout_n": _safe_int(_get(m, "explainability", "rollout_count")),
             }
         )
-    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
+    fig, axes = plt.subplots(1, 3, figsize=(15.2, 4.5))
     labels = ["AUROC", "F1", "CF rate", "CF delta"]
     x = np.arange(len(labels))
     width = 0.35
     for j, row in enumerate(rows):
         vals = [row[k] if row[k] is not None else 0.0 for k in labels]
-        axes[0].bar(x + (j - 0.5) * width, vals, width=width, label=row["name"])
+        bars = axes[0].bar(x + (j - 0.5) * width, vals, width=width, label=row["name"])
+        _add_bar_value_labels(axes[0], bars, nd=3, fontsize=7)
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(labels, rotation=15)
     axes[0].set_title("Q1: no_passer vs both (performance + CF)")
     axes[0].legend()
     axes[0].set_ylim(min(-0.1, np.nanmin([r["CF delta"] or 0 for r in rows]) - 0.05), 1.0)
+    axes[0].grid(axis="y", alpha=0.2)
 
     labels2 = ["Receiver-Passer", "Corridor/Passer", "NearestDef/Passer"]
     x2 = np.arange(len(labels2))
     for j, row in enumerate(rows):
         vals = [row[k] if row[k] is not None else 0.0 for k in labels2]
-        axes[1].bar(x2 + (j - 0.5) * width, vals, width=width, label=row["name"])
+        bars = axes[1].bar(x2 + (j - 0.5) * width, vals, width=width, label=row["name"])
+        _add_bar_value_labels(axes[1], bars, nd=2, fontsize=7)
     axes[1].axhline(0, color="black", lw=0.8)
     axes[1].set_xticks(x2)
     axes[1].set_xticklabels(labels2, rotation=20)
     axes[1].set_title("Q1: focus balance (ViT rollout)")
     axes[1].legend()
-    fig.tight_layout()
+    axes[1].grid(axis="y", alpha=0.2)
+
+    # Attention budget view: normalize positive focus means into a 100% stacked bar.
+    budget_parts = ["passer_mean", "receiver_mean", "corridor_mean", "nearest_defender_mean"]
+    budget_labels = ["Passer", "Receiver", "Corridor", "NearestDef"]
+    budget_colors = ["#1f77b4", "#2ca02c", "#ff7f0e", "#d62728"]
+    x3 = np.arange(len(rows))
+    bottoms = np.zeros(len(rows), dtype=float)
+    for key, lbl, col in zip(budget_parts, budget_labels, budget_colors):
+        vals = np.array([max(0.0, float(r.get(key) or 0.0)) for r in rows], dtype=float)
+        totals = np.array(
+            [sum(max(0.0, float(r.get(k) or 0.0)) for k in budget_parts) for r in rows],
+            dtype=float,
+        )
+        pct = np.divide(vals, totals, out=np.zeros_like(vals), where=totals > 1e-12)
+        axes[2].bar(x3, pct, bottom=bottoms, label=lbl, color=col, width=0.6)
+        for i, p in enumerate(pct):
+            if p >= 0.12:
+                axes[2].text(i, bottoms[i] + p / 2.0, f"{p*100:.0f}%", ha="center", va="center", fontsize=7, color="white")
+        bottoms += pct
+    axes[2].set_ylim(0, 1)
+    axes[2].set_yticks(np.linspace(0, 1, 6))
+    axes[2].set_yticklabels([f"{int(t*100)}%" for t in np.linspace(0, 1, 6)])
+    axes[2].set_xticks(x3)
+    axes[2].set_xticklabels([r["name"] for r in rows])
+    axes[2].set_title("Q1: focus budget (100% stacked)")
+    axes[2].legend(fontsize=8, loc="upper right")
+    axes[2].grid(axis="y", alpha=0.2)
+
+    both = next((r for r in rows if r["name"] == "both"), None)
+    nop = next((r for r in rows if r["name"] == "no_passer"), None)
+    eval_n = both.get("eval_n_test") if both else None
+    rollout_n = both.get("rollout_n") if both else None
+    cf_n = both.get("cf_n") if both else None
+    cap1 = (
+        f"Runs: both vs no_passer | eval_n={eval_n if eval_n is not None else 'NA'} | "
+        f"rollout_n={rollout_n if rollout_n is not None else 'NA'} | CF_n={cf_n if cf_n is not None else 'NA'}"
+    )
+    cap2 = None
+    if both and nop:
+        auroc_gap = (both.get("AUROC") or 0.0) - (nop.get("AUROC") or 0.0)
+        cf_delta_gap = (both.get("CF delta") or 0.0) - (nop.get("CF delta") or 0.0)
+        cap2 = (
+            f"Auto note: AUROC gap={auroc_gap:+.3f}, CF ΔP gap={cf_delta_gap:+.3f}. "
+            "If AUROC is similar but CF ΔP is larger for 'both', passer channel may act as contextual support rather than a pure shortcut."
+        )
+    fig.tight_layout(rect=[0, 0.12, 1, 1])
+    fig.text(0.01, 0.05, cap1, ha="left", va="bottom", fontsize=8)
+    if cap2:
+        fig.text(0.01, 0.015, cap2, ha="left", va="bottom", fontsize=8)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     return True
 
 
-def _plot_q2_counterfactual_flip(compare_metrics: dict[str, Any], out_path: Path) -> bool:
+def _plot_q2_counterfactual_flip(compare_metrics: dict[str, Any], out_path: Path, compare_report_dir: Path | None = None) -> bool:
     try:
         import matplotlib.pyplot as plt
     except Exception:
@@ -138,28 +316,78 @@ def _plot_q2_counterfactual_flip(compare_metrics: dict[str, Any], out_path: Path
         )
     if all(r["overall_rate"] is None and r["flip_rate"] is None for r in rows):
         return False
-    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
+    cf_csv_rows = {m: _load_counterfactual_csv_rows(compare_report_dir, m) for m in models} if compare_report_dir else {}
+    has_dot_panel = any(cf_csv_rows.get(m) for m in models)
+    ncols = 3 if has_dot_panel else 2
+    fig, axes = plt.subplots(1, ncols, figsize=(15.2 if has_dot_panel else 10.8, 4.6))
+    if ncols == 2:
+        axes = np.asarray(axes, dtype=object)
     x = np.arange(len(rows))
     width = 0.36
-    axes[0].bar(x - width / 2, [r["overall_rate"] or 0 for r in rows], width=width, label="overall")
-    axes[0].bar(x + width / 2, [r["flip_rate"] or 0 for r in rows], width=width, label="label-flip subset")
+    bars0 = axes[0].bar(x - width / 2, [r["overall_rate"] or 0 for r in rows], width=width, label="overall")
+    bars1 = axes[0].bar(x + width / 2, [r["flip_rate"] or 0 for r in rows], width=width, label="label-flip subset")
+    _add_bar_value_labels(axes[0], bars0, nd=3, fontsize=7)
+    _add_bar_value_labels(axes[0], bars1, nd=3, fontsize=7)
     axes[0].set_xticks(x)
     axes[0].set_xticklabels([r["model"] for r in rows])
     axes[0].set_ylim(0, 1)
     axes[0].set_title("Q2: Counterfactual on-line > off-line rate")
     axes[0].legend()
+    axes[0].grid(axis="y", alpha=0.2)
     for i, r in enumerate(rows):
         if r["flip_n"] is not None:
-            axes[0].text(i + width / 2, (r["flip_rate"] or 0) + 0.03, f"n={r['flip_n']}", ha="center", fontsize=8)
+            axes[0].text(i + width / 2, min(0.98, (r["flip_rate"] or 0) + 0.06), f"flip n={r['flip_n']}", ha="center", fontsize=8)
 
-    axes[1].bar(x - width / 2, [r["overall_delta"] or 0 for r in rows], width=width, label="overall")
-    axes[1].bar(x + width / 2, [r["flip_delta"] or 0 for r in rows], width=width, label="label-flip subset")
+    bars2 = axes[1].bar(x - width / 2, [r["overall_delta"] or 0 for r in rows], width=width, label="overall")
+    bars3 = axes[1].bar(x + width / 2, [r["flip_delta"] or 0 for r in rows], width=width, label="label-flip subset")
+    _add_bar_value_labels(axes[1], bars2, nd=3, fontsize=7)
+    _add_bar_value_labels(axes[1], bars3, nd=3, fontsize=7)
     axes[1].axhline(0, color="black", lw=0.8)
     axes[1].set_xticks(x)
     axes[1].set_xticklabels([r["model"] for r in rows])
     axes[1].set_title("Q2: Counterfactual ΔP(on-off)")
     axes[1].legend()
-    fig.tight_layout()
+    axes[1].grid(axis="y", alpha=0.2)
+
+    if has_dot_panel:
+        ax = axes[2]
+        ax.axhline(0, color="black", lw=0.8)
+        colors = {"resnet18": "tab:blue", "vit_base": "tab:orange"}
+        for i, model in enumerate(models):
+            model_rows = cf_csv_rows.get(model, [])
+            deltas = np.asarray([r.get("delta_on_minus_off", np.nan) for r in model_rows], dtype=float)
+            if deltas.size == 0:
+                continue
+            flip = np.asarray([bool(r.get("is_label_flip")) if r.get("is_label_flip") is not None else False for r in model_rows], dtype=bool)
+            jitter = np.linspace(-0.12, 0.12, len(deltas)) if len(deltas) > 1 else np.array([0.0], dtype=float)
+            xj = i + jitter
+            ax.scatter(xj, deltas, s=22, alpha=0.45, color="0.65", label="all samples" if i == 0 else None)
+            if np.any(flip):
+                ax.scatter(xj[flip], deltas[flip], s=30, alpha=0.9, color=colors[model], edgecolor="black", linewidth=0.3, label="label-flip subset" if i == 0 else None)
+            mu = float(np.nanmean(deltas)) if np.any(np.isfinite(deltas)) else np.nan
+            if np.isfinite(mu):
+                ax.scatter([i], [mu], s=60, marker="D", color=colors[model], edgecolor="black", linewidth=0.5, zorder=4)
+            ax.text(i, ax.get_ylim()[1] if np.isfinite(ax.get_ylim()[1]) else 0.0, "", alpha=0.0)  # keep autoscale stable before annotations
+            ax.text(
+                i,
+                np.nanmax(deltas[np.isfinite(deltas)]) + 0.01 if np.any(np.isfinite(deltas)) else 0.02,
+                f"n={len(deltas)}, flip={int(np.sum(flip))}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        ax.set_xticks(np.arange(len(models)))
+        ax.set_xticklabels(models)
+        ax.set_title("Q2: Sample-level ΔP (local geometric intervention)")
+        ax.set_ylabel("ΔP(on-line - off-line)")
+        ax.grid(axis="y", alpha=0.2)
+        ax.legend(fontsize=8, loc="best")
+
+    flip_ns = [r.get("flip_n") for r in rows if r.get("flip_n") is not None]
+    flip_n_note = f"label-flip subset n per model: {flip_ns}" if flip_ns else "label-flip subset n unavailable"
+    fig.subplots_adjust(left=0.06, right=0.99, top=0.90, bottom=0.24, wspace=0.28)
+    fig.text(0.01, 0.05, "Counterfactual here is a local geometric intervention (nearest-defender on-line vs off-line), not a full tactical counterfactual.", ha="left", va="bottom", fontsize=8)
+    fig.text(0.01, 0.02, f"Small-n caveat: {flip_n_note}. Interpret flip-subset magnitudes as structure-sensitivity sanity checks.", ha="left", va="bottom", fontsize=8)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -199,30 +427,61 @@ def _plot_q3_role_map(metrics_map: dict[str, dict[str, Any]], out_path: Path) ->
     den = np.where((mx - mn) > 1e-8, (mx - mn), 1.0)
     mat_norm = (mat - mn) / den
 
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.6))
+    fig, axes = plt.subplots(1, 2, figsize=(12.2, 4.8))
     im = axes[0].imshow(mat_norm, cmap="viridis", aspect="auto", vmin=0, vmax=1)
     axes[0].set_xticks(np.arange(len(metrics_names)))
     axes[0].set_xticklabels(metrics_names, rotation=25, ha="right")
     axes[0].set_yticks(np.arange(len(rows)))
     axes[0].set_yticklabels([r["run"] for r in rows])
-    axes[0].set_title("Q3: Role heatmap (column-normalized)")
+    axes[0].set_title("Q3: Role heatmap (column-normalized background, raw values annotated)")
     for i in range(mat.shape[0]):
         for j in range(mat.shape[1]):
             axes[0].text(j, i, f"{mat[i,j]:.2f}", ha="center", va="center", color="white", fontsize=8)
     fig.colorbar(im, ax=axes[0], fraction=0.046, pad=0.04)
+    axes[0].text(
+        0.01,
+        -0.16,
+        "Discrimination vs structure-sensitivity metrics are mixed columns; background is normalized, numbers are raw.",
+        transform=axes[0].transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+    )
 
     x = np.array([r["AUROC"] for r in rows], dtype=float)
     y = np.array([r["CF_flip_rate"] for r in rows], dtype=float)
     axes[1].scatter(x, y, s=80, c=["tab:blue", "tab:orange", "tab:green"])
+    text_offsets = {
+        "line_only": (0.004, 0.015),
+        "corridor_only": (-0.035, -0.035),
+        "both": (0.006, 0.030),
+    }
     for xi, yi, r in zip(x, y, rows):
-        axes[1].text(xi + 0.002, yi + 0.01, r["run"], fontsize=9)
+        dx, dy = text_offsets.get(r["run"], (0.004, 0.01))
+        axes[1].text(
+            xi + dx,
+            yi + dy,
+            r["run"],
+            fontsize=9,
+            bbox={"boxstyle": "round,pad=0.15", "facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+        )
     axes[1].set_xlim(max(0, np.nanmin(x) - 0.05), min(1.0, np.nanmax(x) + 0.08))
     axes[1].set_ylim(0, 1.02)
     axes[1].set_xlabel("Discrimination (AUROC)")
     axes[1].set_ylabel("Structure sensitivity (CF flip-subset rate)")
     axes[1].set_title("Q3: Channel role map")
     axes[1].grid(alpha=0.2)
-    fig.tight_layout()
+    axes[1].text(
+        0.02,
+        0.02,
+        "Right = better discrimination (AUROC)\nUp = stronger structure sensitivity (CF flip-subset rate)",
+        transform=axes[1].transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=8,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.8, "edgecolor": "0.8"},
+    )
+    fig.tight_layout(rect=[0, 0.04, 1, 1])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -257,28 +516,53 @@ def _plot_q4_compare_focus(compare_metrics: dict[str, Any], out_path: Path) -> b
                 "NearestDef/Passer": _safe_float(rf.get("nearest_defender_to_passer_ratio")) or 0.0,
             }
         )
-    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.4))
+    fig, axes = plt.subplots(1, 2, figsize=(12.2, 4.8))
     x = np.arange(len(rows))
     width = 0.18
     perf_cols = ["AUROC", "F1", "CF rate", "CF flip"]
     for j, col in enumerate(perf_cols):
-        axes[0].bar(x + (j - 1.5) * width, [r[col] for r in rows], width=width, label=col)
+        bars = axes[0].bar(x + (j - 1.5) * width, [r[col] for r in rows], width=width, label=col)
+        _add_bar_value_labels(axes[0], bars, nd=3, fontsize=7)
     axes[0].set_xticks(x)
     axes[0].set_xticklabels([r["model"] for r in rows])
     axes[0].set_ylim(0, 1)
     axes[0].set_title("Q4: CNN vs ViT (performance + counterfactual)")
     axes[0].legend(fontsize=8)
+    axes[0].grid(axis="y", alpha=0.2)
 
     focus_cols = ["Receiver-Passer", "Corridor/Passer", "NearestDef/Passer"]
     width2 = 0.22
     for j, col in enumerate(focus_cols):
-        axes[1].bar(x + (j - 1) * width2, [r[col] for r in rows], width=width2, label=col)
+        bars = axes[1].bar(x + (j - 1) * width2, [r[col] for r in rows], width=width2, label=col)
+        _add_bar_value_labels(axes[1], bars, nd=2, fontsize=7)
     axes[1].axhline(0, color="black", lw=0.8)
     axes[1].set_xticks(x)
-    axes[1].set_xticklabels([f"{r['model']}\n({r['method']})" for r in rows], fontsize=8)
+    axes[1].set_xticklabels(
+        ["resnet18\n(proxy saliency)" if r["model"] == "resnet18" else "vit_base\n(attn rollout)" for r in rows],
+        fontsize=8,
+    )
     axes[1].set_title("Q4: Common focus metrics")
     axes[1].legend(fontsize=8)
-    fig.tight_layout()
+    axes[1].grid(axis="y", alpha=0.2)
+    axes[1].text(
+        0.02,
+        0.02,
+        "Receiver-Passer > 0: receiver-focused\nCorridor/Passer or NearestDef/Passer > 1: structure region exceeds passer focus",
+        transform=axes[1].transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=8,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.8, "edgecolor": "0.8"},
+    )
+    fig.tight_layout(rect=[0, 0.08, 1, 1])
+    fig.text(
+        0.01,
+        0.02,
+        "ResNet18 focus uses input_grad * input patch-mean saliency proxy (not Grad-CAM).",
+        ha="left",
+        va="bottom",
+        fontsize=8,
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -308,12 +592,16 @@ def _passcentric_average(
     corridor_w_m: float = 8.0,
     u_range: tuple[float, float] = (-0.25, 1.25),
     v_range: tuple[float, float] = (-2.0, 2.0),
-    out_hw: tuple[int, int] = (80, 80),
+    out_hw: tuple[int, int] = (96, 96),
+    splat_sigma_cells: float = 0.85,
+    splat_radius: int = 2,
 ) -> dict[str, Any] | None:
     heats = np.asarray(sample_npz.get("heat_patches"), dtype=np.float32)
     if heats.ndim != 3 or len(heats) == 0:
         return None
     labels = np.asarray(sample_npz.get("labels"), dtype=np.int64)
+    if labels.shape[0] != heats.shape[0]:
+        labels = np.zeros((heats.shape[0],), dtype=np.int64)
     px = int(np.asarray(sample_npz.get("patch_size"))[0])
     gh = int(np.asarray(sample_npz.get("grid_h"))[0])
     gw = int(np.asarray(sample_npz.get("grid_w"))[0])
@@ -333,6 +621,9 @@ def _passcentric_average(
 
     u0, u1 = u_range
     v0, v1 = v_range
+    sigma = max(1e-6, float(splat_sigma_cells))
+    rad = max(1, int(splat_radius))
+    n_used = 0
     for i in range(len(heats)):
         p0 = np.array([p0x[i], p0y[i]], dtype=np.float32)
         p1 = np.array([p1x[i], p1y[i]], dtype=np.float32)
@@ -345,21 +636,37 @@ def _passcentric_average(
         rel = patch_centers - p0[None, :]
         u = (rel @ e1) / L
         vlat = (rel @ e2) / max(1e-6, float(corridor_w_m))
-        uu = ((u - u0) / (u1 - u0) * (W - 1)).astype(int)
-        vv = ((vlat - v0) / (v1 - v0) * (H - 1)).astype(int)
-        mask = (uu >= 0) & (uu < W) & (vv >= 0) & (vv < H)
+        xg = (u - u0) / (u1 - u0) * (W - 1)
+        yg = (vlat - v0) / (v1 - v0) * (H - 1)
+        mask = np.isfinite(xg) & np.isfinite(yg) & (xg >= 0) & (xg <= (W - 1)) & (yg >= 0) & (yg <= (H - 1))
         if not np.any(mask):
             continue
         hflat = heats[i].reshape(-1).astype(np.float64)
-        for x_idx, y_idx, val in zip(uu[mask], vv[mask], hflat[mask]):
-            num_all[y_idx, x_idx] += val
-            den_all[y_idx, x_idx] += 1.0
+        n_used += 1
+        for xc, yc, val in zip(xg[mask], yg[mask], hflat[mask]):
+            if not np.isfinite(val):
+                continue
+            ix = int(np.floor(xc))
+            iy = int(np.floor(yc))
+            xs = np.arange(max(0, ix - rad), min(W - 1, ix + rad) + 1, dtype=int)
+            ys = np.arange(max(0, iy - rad), min(H - 1, iy + rad) + 1, dtype=int)
+            if xs.size == 0 or ys.size == 0:
+                continue
+            dx2 = (xs.astype(np.float64) - float(xc)) ** 2
+            dy2 = (ys.astype(np.float64) - float(yc)) ** 2
+            ker = np.exp(-(dy2[:, None] + dx2[None, :]) / (2.0 * sigma * sigma))
+            s = float(np.sum(ker))
+            if not np.isfinite(s) or s <= 0:
+                continue
+            ker = ker / s
+            num_all[np.ix_(ys, xs)] += val * ker
+            den_all[np.ix_(ys, xs)] += ker
             if int(labels[i]) == 1:
-                num_l1[y_idx, x_idx] += val
-                den_l1[y_idx, x_idx] += 1.0
+                num_l1[np.ix_(ys, xs)] += val * ker
+                den_l1[np.ix_(ys, xs)] += ker
             else:
-                num_l0[y_idx, x_idx] += val
-                den_l0[y_idx, x_idx] += 1.0
+                num_l0[np.ix_(ys, xs)] += val * ker
+                den_l0[np.ix_(ys, xs)] += ker
 
     def _mean(num, den):
         out = np.full_like(num, np.nan, dtype=np.float64)
@@ -375,15 +682,28 @@ def _passcentric_average(
         "mean_l0": mean_l0,
         "mean_l1": mean_l1,
         "diff_l1_l0": diff_l1_l0,
+        "count_all": den_all,
+        "count_l0": den_l0,
+        "count_l1": den_l1,
         "u_range": u_range,
         "v_range": v_range,
         "n_samples": int(len(heats)),
+        "n_used_samples": int(n_used),
         "n_label1": int(np.sum(labels == 1)),
         "n_label0": int(np.sum(labels == 0)),
+        "method": str(np.asarray(sample_npz.get("method"), dtype=object)[0]) if sample_npz.get("method") is not None else "unknown",
     }
 
 
-def _plot_passcentric_heatmap(sample_npz_path: Path, out_path: Path, title_prefix: str) -> bool:
+def _plot_passcentric_heatmap(
+    sample_npz_path: Path,
+    out_path: Path,
+    title_prefix: str,
+    *,
+    grid_size: int = 96,
+    splat_sigma_cells: float = 0.85,
+    min_count: float = 2.0,
+) -> bool:
     try:
         import matplotlib.pyplot as plt
     except Exception:
@@ -391,42 +711,76 @@ def _plot_passcentric_heatmap(sample_npz_path: Path, out_path: Path, title_prefi
     d = _load_explainability_npz(sample_npz_path)
     if d is None:
         return False
-    acc = _passcentric_average(d)
+    acc = _passcentric_average(d, out_hw=(int(grid_size), int(grid_size)), splat_sigma_cells=float(splat_sigma_cells))
     if acc is None:
         return False
-    fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.2))
-    mean_all = acc["mean_all"]
-    diff = acc["diff_l1_l0"]
+    fig, axes = plt.subplots(2, 2, figsize=(11.0, 8.8))
+    axes = np.asarray(axes, dtype=object)
+    mean_all = _mask_by_count(acc["mean_all"], acc.get("count_all"), min_count=min_count)
+    mean_l0 = _mask_by_count(acc["mean_l0"], acc.get("count_l0"), min_count=min_count)
+    mean_l1 = _mask_by_count(acc["mean_l1"], acc.get("count_l1"), min_count=min_count)
+    count_shared = np.minimum(np.asarray(acc.get("count_l0"), dtype=float), np.asarray(acc.get("count_l1"), dtype=float))
+    diff = _mask_by_count(acc["diff_l1_l0"], count_shared, min_count=min_count)
     u0, u1 = acc["u_range"]
     v0, v1 = acc["v_range"]
     extent = [u0, u1, v0, v1]
-    im0 = axes[0].imshow(mean_all, origin="lower", cmap="inferno", aspect="auto", extent=extent)
-    axes[0].axhline(0, color="cyan", lw=0.8, alpha=0.7)
-    axes[0].axvline(0, color="white", lw=0.8, alpha=0.7)
-    axes[0].axvline(1, color="white", lw=0.8, alpha=0.7, ls="--")
-    axes[0].set_title(f"{title_prefix}: pass-centric mean heat")
-    axes[0].set_xlabel("longitudinal (pass-normalized, passer=0, receiver=1)")
-    axes[0].set_ylabel("lateral (corridor-width normalized)")
-    fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-
-    vmax = np.nanmax(np.abs(diff)) if np.isfinite(np.nanmax(np.abs(diff))) else 1.0
-    vmax = max(vmax, 1e-6)
-    im1 = axes[1].imshow(diff, origin="lower", cmap="coolwarm", aspect="auto", extent=extent, vmin=-vmax, vmax=vmax)
-    axes[1].axhline(0, color="black", lw=0.8, alpha=0.7)
-    axes[1].axvline(0, color="black", lw=0.8, alpha=0.7)
-    axes[1].axvline(1, color="black", lw=0.8, alpha=0.7, ls="--")
-    axes[1].set_title(f"{title_prefix}: label1 - label0")
-    axes[1].set_xlabel("longitudinal (pass-normalized)")
-    axes[1].set_ylabel("lateral / corridor width")
-    fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-    fig.tight_layout()
+    inferno = plt.get_cmap("inferno").copy()
+    inferno.set_bad("#d0d0d0")
+    coolwarm = plt.get_cmap("coolwarm").copy()
+    coolwarm.set_bad("#d0d0d0")
+    mean_vmin, mean_vmax = _nan_min_max([mean_all, mean_l0, mean_l1], default=(0.0, 1.0))
+    if not np.isfinite(mean_vmin):
+        mean_vmin = 0.0
+    if not np.isfinite(mean_vmax) or mean_vmax <= mean_vmin:
+        mean_vmax = mean_vmin + 1e-6
+    diff_vmax = max(_nan_abs_max(diff, default=1.0), 1e-6)
+    panels = [
+        (axes[0, 0], mean_all, acc.get("count_all"), f"{title_prefix}: all (n={acc['n_samples']}, used={acc.get('n_used_samples','NA')})", inferno, True, {"vmin": mean_vmin, "vmax": mean_vmax}),
+        (axes[0, 1], mean_l0, acc.get("count_l0"), f"{title_prefix}: label0 (n0={acc['n_label0']})", inferno, True, {"vmin": mean_vmin, "vmax": mean_vmax}),
+        (axes[1, 0], mean_l1, acc.get("count_l1"), f"{title_prefix}: label1 (n1={acc['n_label1']})", inferno, True, {"vmin": mean_vmin, "vmax": mean_vmax}),
+        (axes[1, 1], diff, count_shared, f"{title_prefix}: label1 - label0", coolwarm, False, {"vmin": -diff_vmax, "vmax": diff_vmax}),
+    ]
+    for ax, arr, count_map, ttl, cmap, dark_bg, scale_kwargs in panels:
+        im = ax.imshow(arr, origin="lower", cmap=cmap, aspect="auto", extent=extent, **scale_kwargs)
+        _draw_passcentric_guides(ax, dark_bg=dark_bg)
+        ax.set_title(ttl)
+        ax.set_xlabel("u (pass-normalized; passer=0, receiver=1)")
+        ax.set_ylabel("v / corridor width")
+        cmax = _nan_abs_max(np.asarray(count_map), default=0.0) if count_map is not None else 0.0
+        ax.text(
+            0.99,
+            0.02,
+            f"min_count={min_count:g}\nmax occ={cmax:.1f}",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=7,
+            bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.75, "edgecolor": "0.8"},
+        )
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.suptitle(
+        f"Pass-centric heatmaps ({title_prefix}) | method={acc.get('method','unknown')} | Gaussian splat σ={splat_sigma_cells} cells",
+        fontsize=10,
+    )
+    fig.tight_layout(rect=[0, 0.03, 1, 0.97])
+    fig.text(0.01, 0.005, "Gray cells indicate low occupancy / insufficient support after pass-centric alignment.", ha="left", va="bottom", fontsize=8)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     return True
 
 
-def _plot_passcentric_compare(sample_npz_a: Path, label_a: str, sample_npz_b: Path, label_b: str, out_path: Path) -> bool:
+def _plot_passcentric_compare(
+    sample_npz_a: Path,
+    label_a: str,
+    sample_npz_b: Path,
+    label_b: str,
+    out_path: Path,
+    *,
+    grid_size: int = 96,
+    splat_sigma_cells: float = 0.85,
+    min_count: float = 2.0,
+) -> bool:
     try:
         import matplotlib.pyplot as plt
     except Exception:
@@ -435,31 +789,71 @@ def _plot_passcentric_compare(sample_npz_a: Path, label_a: str, sample_npz_b: Pa
     d_b = _load_explainability_npz(sample_npz_b)
     if d_a is None or d_b is None:
         return False
-    a = _passcentric_average(d_a)
-    b = _passcentric_average(d_b)
+    a = _passcentric_average(d_a, out_hw=(int(grid_size), int(grid_size)), splat_sigma_cells=float(splat_sigma_cells))
+    b = _passcentric_average(d_b, out_hw=(int(grid_size), int(grid_size)), splat_sigma_cells=float(splat_sigma_cells))
     if a is None or b is None:
         return False
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.2))
+    fig, axes = plt.subplots(1, 3, figsize=(13.8, 4.6))
     u0, u1 = a["u_range"]; v0, v1 = a["v_range"]
     extent = [u0, u1, v0, v1]
-    arrs = [a["mean_all"], b["mean_all"], a["mean_all"] - b["mean_all"]]
-    titles = [f"{label_a} mean", f"{label_b} mean", f"{label_a} - {label_b}"]
+    a_mean = _mask_by_count(a["mean_all"], a.get("count_all"), min_count=min_count)
+    b_mean = _mask_by_count(b["mean_all"], b.get("count_all"), min_count=min_count)
+    shared_count = np.minimum(np.asarray(a.get("count_all"), dtype=float), np.asarray(b.get("count_all"), dtype=float))
+    diff_mean = _mask_by_count(a["mean_all"] - b["mean_all"], shared_count, min_count=min_count)
+    arrs = [a_mean, b_mean, diff_mean]
+    titles = [
+        f"{label_a} mean (n={a['n_samples']}, y1={a['n_label1']})",
+        f"{label_b} mean (n={b['n_samples']}, y1={b['n_label1']})",
+        f"{label_a} - {label_b}",
+    ]
     cmaps = ["inferno", "inferno", "coolwarm"]
-    vmax_diff = np.nanmax(np.abs(arrs[2])) if np.isfinite(np.nanmax(np.abs(arrs[2]))) else 1.0
-    for ax, arr, ttl, cm in zip(axes, arrs, titles, cmaps):
+    inferno = plt.get_cmap("inferno").copy()
+    inferno.set_bad("#d0d0d0")
+    coolwarm = plt.get_cmap("coolwarm").copy()
+    coolwarm.set_bad("#d0d0d0")
+    mean_vmin, mean_vmax = _nan_min_max([a_mean, b_mean], default=(0.0, 1.0))
+    if not np.isfinite(mean_vmin):
+        mean_vmin = 0.0
+    if not np.isfinite(mean_vmax) or mean_vmax <= mean_vmin:
+        mean_vmax = mean_vmin + 1e-6
+    vmax_diff = max(_nan_abs_max(diff_mean, default=1.0), 1e-6)
+    for idx, (ax, arr, ttl, cm) in enumerate(zip(axes, arrs, titles, cmaps)):
         kwargs = {}
         if cm == "coolwarm":
             kwargs["vmin"] = -max(vmax_diff, 1e-6)
             kwargs["vmax"] = max(vmax_diff, 1e-6)
-        im = ax.imshow(arr, origin="lower", aspect="auto", extent=extent, cmap=cm, **kwargs)
-        ax.axhline(0, color="white" if cm == "inferno" else "black", lw=0.8, alpha=0.7)
-        ax.axvline(0, color="white" if cm == "inferno" else "black", lw=0.8, alpha=0.7)
-        ax.axvline(1, color="white" if cm == "inferno" else "black", lw=0.8, alpha=0.7, ls="--")
+            count_map = shared_count
+            cmap = coolwarm
+            dark_bg = False
+        else:
+            kwargs["vmin"] = mean_vmin
+            kwargs["vmax"] = mean_vmax
+            count_map = a.get("count_all") if idx == 0 else b.get("count_all")
+            cmap = inferno
+            dark_bg = True
+        im = ax.imshow(arr, origin="lower", aspect="auto", extent=extent, cmap=cmap, **kwargs)
+        _draw_passcentric_guides(ax, dark_bg=dark_bg)
         ax.set_title(ttl)
         ax.set_xlabel("u (pass-normalized)")
         ax.set_ylabel("v / corridor")
+        cmax = _nan_abs_max(np.asarray(count_map), default=0.0) if count_map is not None else 0.0
+        ax.text(
+            0.99,
+            0.02,
+            f"min_count={min_count:g}\nmax occ={cmax:.1f}",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=7,
+            bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.75, "edgecolor": "0.8"},
+        )
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
+    fig.suptitle(
+        f"Pass-centric compare | shared normalization for mean maps | Gaussian splat σ={splat_sigma_cells} cells",
+        fontsize=10,
+    )
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.text(0.01, 0.005, "Gray cells indicate low occupancy / insufficient support after alignment.", ha="left", va="bottom", fontsize=8)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -623,14 +1017,19 @@ def cmd_questions(args: argparse.Namespace) -> None:
     ensure_dirs(out_dir)
     metrics_map = {name: _load_metrics(path) for name, path in named.items()}
     created: list[str] = []
+    passcentric_opts = {
+        "grid_size": int(getattr(args, "passcentric_grid_size", 96)),
+        "splat_sigma_cells": float(getattr(args, "passcentric_splat_sigma", 0.85)),
+        "min_count": float(getattr(args, "passcentric_min_count", 2.0)),
+    }
 
     # Q1: no_passer vs both
-    if _plot_q1_no_passer(metrics_map, out_dir / "q1_no_passer_vs_both.png"):
+    if _plot_q1_no_passer(metrics_map, out_dir / "q1_no_passer_vs_both.png", report_dirs=named):
         created.append(str(out_dir / "q1_no_passer_vs_both.png"))
 
     # Q2/Q4 from compare report if provided
     if "compare" in metrics_map:
-        if _plot_q2_counterfactual_flip(metrics_map["compare"], out_dir / "q2_counterfactual_label_flip.png"):
+        if _plot_q2_counterfactual_flip(metrics_map["compare"], out_dir / "q2_counterfactual_label_flip.png", compare_report_dir=named.get("compare")):
             created.append(str(out_dir / "q2_counterfactual_label_flip.png"))
         if _plot_q4_compare_focus(metrics_map["compare"], out_dir / "q4_cnn_vs_vit_focus_compare.png"):
             created.append(str(out_dir / "q4_cnn_vs_vit_focus_compare.png"))
@@ -642,10 +1041,10 @@ def cmd_questions(args: argparse.Namespace) -> None:
     # Pass-centric averages for any report dirs that have exported explainability NPZs.
     for name, rdir in named.items():
         vit_npz = rdir / "vit_rollout_samples.npz"
-        if _plot_passcentric_heatmap(vit_npz, out_dir / f"passcentric_{name}_vit_rollout.png", f"{name}/ViT"):
+        if _plot_passcentric_heatmap(vit_npz, out_dir / f"passcentric_{name}_vit_rollout.png", f"{name}/ViT", **passcentric_opts):
             created.append(str(out_dir / f"passcentric_{name}_vit_rollout.png"))
         res_npz = rdir / "resnet18_focus_samples.npz"
-        if _plot_passcentric_heatmap(res_npz, out_dir / f"passcentric_{name}_resnet18_focus.png", f"{name}/ResNet18"):
+        if _plot_passcentric_heatmap(res_npz, out_dir / f"passcentric_{name}_resnet18_focus.png", f"{name}/ResNet18", **passcentric_opts):
             created.append(str(out_dir / f"passcentric_{name}_resnet18_focus.png"))
 
     # Q1 pass-centric compare (both vs no_passer) if available.
@@ -656,6 +1055,7 @@ def cmd_questions(args: argparse.Namespace) -> None:
             named["no_passer"] / "vit_rollout_samples.npz",
             "no_passer",
             out_dir / "q1_passcentric_both_vs_no_passer_vit.png",
+            **passcentric_opts,
         ):
             created.append(str(out_dir / "q1_passcentric_both_vs_no_passer_vit.png"))
 
@@ -667,11 +1067,17 @@ def cmd_questions(args: argparse.Namespace) -> None:
             named["compare"] / "resnet18_focus_samples.npz",
             "ResNet18",
             out_dir / "q4_passcentric_vit_vs_resnet.png",
+            **passcentric_opts,
         ):
             created.append(str(out_dir / "q4_passcentric_vit_vs_resnet.png"))
 
     # Save a machine-readable summary to make zipping/downloading easy.
-    summary = {"out_dir": str(out_dir), "named_reports": {k: str(v) for k, v in named.items()}, "created": created}
+    summary = {
+        "out_dir": str(out_dir),
+        "named_reports": {k: str(v) for k, v in named.items()},
+        "created": created,
+        "passcentric_options": passcentric_opts,
+    }
     (out_dir / "questions_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 
@@ -691,6 +1097,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated name=report_dir entries. Recommended names: both,no_passer,line_only,corridor_only,compare",
     )
     q.add_argument("--out-dir", default="reports/question_figures")
+    q.add_argument("--passcentric-grid-size", type=int, default=96)
+    q.add_argument("--passcentric-splat-sigma", type=float, default=0.85, help="Gaussian splat sigma in output-grid cells")
+    q.add_argument("--passcentric-min-count", type=float, default=2.0, help="Gray-mask cells with occupancy below this threshold")
     q.set_defaults(func=cmd_questions)
     return p
 
