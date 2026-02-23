@@ -153,6 +153,7 @@ def _counterfactual_stratified_summary(cf_rows: list[dict[str, Any]], cfg: dict[
     dist = np.asarray([float(r.get("nearest_orig_dist_to_line_m", np.nan)) for r in cf_rows], dtype=float)
     label_on = np.asarray([int(r.get("label_on_line", 0)) for r in cf_rows], dtype=int)
     label_off = np.asarray([int(r.get("label_off_line", 0)) for r in cf_rows], dtype=int)
+    label_flip = label_on != label_off
 
     def _summary(mask: np.ndarray) -> dict[str, Any]:
         m = np.asarray(mask, dtype=bool)
@@ -176,6 +177,10 @@ def _counterfactual_stratified_summary(cf_rows: list[dict[str, Any]], cfg: dict[
             "0": _summary(orig_label == 0),
             "1": _summary(orig_label == 1),
         },
+        "by_label_flip": {
+            "no_flip": _summary(~label_flip),
+            "flip": _summary(label_flip),
+        },
     }
 
     eval_cfg = cfg.get("eval", {})
@@ -192,6 +197,178 @@ def _counterfactual_stratified_summary(cf_rows: list[dict[str, Any]], cfg: dict[
             row.update(_summary(mask))
             rows.append(row)
         out["by_nearest_dist_bin_m"] = rows
+    return out
+
+
+def _safe_ratio(a: float | None, b: float | None) -> float | None:
+    if a is None or b is None:
+        return None
+    if not np.isfinite(a) or not np.isfinite(b) or abs(b) < 1e-8:
+        return None
+    return float(a / b)
+
+
+def _focus_features_from_patch_heat(
+    heat: np.ndarray,
+    y_label: int,
+    row,
+    grid_hw: tuple[int, int],
+    patch_size: int,
+    cfg: dict[str, Any],
+    rs: RasterSpec,
+) -> dict[str, Any]:
+    def _patch_focus(x_m: float, y_m: float, radius: int = 1) -> float:
+        x_px, y_px = meters_to_pixel(float(x_m), float(y_m), rs)
+        px = int(np.clip(np.floor(x_px / patch_size), 0, grid_hw[1] - 1))
+        py = int(np.clip(np.floor(y_px / patch_size), 0, grid_hw[0] - 1))
+        y0 = max(0, py - radius)
+        y1 = min(grid_hw[0], py + radius + 1)
+        x0 = max(0, px - radius)
+        x1 = min(grid_hw[1], px + radius + 1)
+        patch = heat[y0:y1, x0:x1]
+        return float(np.mean(patch)) if patch.size else float("nan")
+
+    p0_m = np.array([float(row.passer_x_m), float(row.passer_y_m)], dtype=float)
+    p1_m = np.array([float(row.receiver_x_m), float(row.receiver_y_m)], dtype=float)
+
+    yy_idx, xx_idx = np.mgrid[0 : grid_hw[0], 0 : grid_hw[1]]
+    x_px_cent = (xx_idx + 0.5) * patch_size
+    y_px_cent = (yy_idx + 0.5) * patch_size
+    x_px_cent = np.clip(x_px_cent, 0, rs.size - 1)
+    y_px_cent = np.clip(y_px_cent, 0, rs.size - 1)
+    x_m_cent, y_m_cent = _pixel_to_meters(x_px_cent, y_px_cent, rs)
+    patch_pts_m = np.stack([x_m_cent, y_m_cent], axis=-1).reshape(-1, 2)
+    t_patch, d_patch = _line_projection_and_distance(patch_pts_m, p0_m, p1_m)
+    corr_w = float(cfg.get("labeling", {}).get("corridor_w_m", rs.corridor_w_m))
+    corridor_mask = ((t_patch >= 0.0) & (t_patch <= 1.0) & (d_patch <= corr_w)).reshape(grid_hw)
+    corridor_focus = float(np.nanmean(heat[corridor_mask])) if np.any(corridor_mask) else float("nan")
+
+    defenders = _parse_points(getattr(row, "defending_xy_json", ""))
+    nearest_def_focus = float("nan")
+    nearest_def_dist = float("nan")
+    if len(defenders):
+        _, d_def = _line_projection_and_distance(defenders, p0_m, p1_m)
+        idx_near = int(np.argmin(d_def))
+        nearest_def_dist = float(d_def[idx_near])
+        nearest_def_focus = _patch_focus(defenders[idx_near, 0], defenders[idx_near, 1])
+
+    passer_focus = _patch_focus(row.passer_x_m, row.passer_y_m)
+    receiver_focus = _patch_focus(row.receiver_x_m, row.receiver_y_m)
+    return {
+        "label": int(y_label),
+        "passer_focus_mean": passer_focus,
+        "receiver_focus_mean": receiver_focus,
+        "receiver_minus_passer": receiver_focus - passer_focus,
+        "corridor_focus_mean": corridor_focus,
+        "nearest_defender_focus_mean": nearest_def_focus,
+        "nearest_defender_dist_to_line_m": nearest_def_dist,
+    }
+
+
+def _aggregate_focus_rows(focus_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not focus_rows:
+        return {}
+    f_lab = np.array([r["label"] for r in focus_rows], dtype=int)
+    f_p = np.array([r["passer_focus_mean"] for r in focus_rows], dtype=float)
+    f_r = np.array([r["receiver_focus_mean"] for r in focus_rows], dtype=float)
+    f_d = np.array([r["receiver_minus_passer"] for r in focus_rows], dtype=float)
+    f_c = np.array([r.get("corridor_focus_mean", np.nan) for r in focus_rows], dtype=float)
+    f_nd = np.array([r.get("nearest_defender_focus_mean", np.nan) for r in focus_rows], dtype=float)
+
+    def _focus_block(mask: np.ndarray) -> dict[str, Any]:
+        m = np.asarray(mask, dtype=bool)
+        if not np.any(m):
+            return {
+                "passer_mean": None,
+                "receiver_mean": None,
+                "receiver_minus_passer_mean": None,
+                "corridor_mean": None,
+                "nearest_defender_mean": None,
+                "corridor_to_passer_ratio": None,
+                "nearest_defender_to_passer_ratio": None,
+            }
+        passer_mean = float(np.nanmean(f_p[m]))
+        receiver_mean = float(np.nanmean(f_r[m]))
+        receiver_minus_passer_mean = float(np.nanmean(f_d[m]))
+        corridor_mean = float(np.nanmean(f_c[m]))
+        nearest_defender_mean = float(np.nanmean(f_nd[m]))
+        return {
+            "passer_mean": passer_mean,
+            "receiver_mean": receiver_mean,
+            "receiver_minus_passer_mean": receiver_minus_passer_mean,
+            "corridor_mean": corridor_mean,
+            "nearest_defender_mean": nearest_defender_mean,
+            "corridor_to_passer_ratio": _safe_ratio(corridor_mean, passer_mean),
+            "nearest_defender_to_passer_ratio": _safe_ratio(nearest_defender_mean, passer_mean),
+        }
+
+    return {
+        "label0": _focus_block(f_lab == 0),
+        "label1": _focus_block(f_lab == 1),
+        "overall": _focus_block(np.ones_like(f_lab, dtype=bool)),
+    }
+
+
+def _generate_resnet18_focus_summary(
+    X_img_test: np.ndarray,
+    y_test: np.ndarray,
+    meta_test,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Generate lightweight CNN saliency focus metrics for comparison with ViT rollout focus.
+
+    This is not Grad-CAM; it uses input-gradient saliency as a quick proxy so we can compare
+    spatial focus (passer/receiver/corridor/nearest defender) across architectures.
+    """
+    resnet_path = _paths(cfg)["models"] / "resnet18.pt"
+    if not resnet_path.exists():
+        return {"status": "resnet18_checkpoint_missing"}
+    try:  # pragma: no cover - torch dependent
+        import torch
+        from .models.cnn import create_resnet18
+    except Exception:
+        return {"status": "torch_missing"}
+
+    ckpt = torch.load(resnet_path, map_location="cpu")
+    model = create_resnet18(in_chans=int(X_img_test.shape[1]), num_classes=2, pretrained=False)
+    model.load_state_dict(ckpt["state_dict"], strict=False)
+    model.eval()
+
+    n_samples = int(cfg.get("eval", {}).get("n_rollout_samples", 30))
+    n_samples = min(n_samples, len(X_img_test))
+    if n_samples <= 0:
+        return {"status": "no_samples"}
+
+    patch_size = 16
+    grid_hw = (X_img_test.shape[-2] // patch_size, X_img_test.shape[-1] // patch_size)
+    rs = _counterfactual_render_spec(cfg)
+    focus_rows = []
+    for i in range(n_samples):
+        xb = torch.tensor(X_img_test[i : i + 1], dtype=torch.float32, requires_grad=True)
+        logits = model(xb)
+        if logits.ndim == 2 and logits.shape[1] == 2:
+            score = (logits[:, 1] - logits[:, 0]).sum()
+        else:
+            score = logits.squeeze(-1).sum()
+        model.zero_grad(set_to_none=True)
+        if xb.grad is not None:
+            xb.grad.zero_()
+        score.backward()
+        grad = xb.grad.detach().cpu().numpy()[0]
+        img = xb.detach().cpu().numpy()[0]
+        heat_big = np.abs(grad * img).mean(axis=0)
+        heat_big = heat_big - np.min(heat_big)
+        if float(np.max(heat_big)) > 0:
+            heat_big = heat_big / float(np.max(heat_big))
+        # Convert to 14x14 patch grid for common focus extraction with ViT.
+        h, w = heat_big.shape
+        gh, gw = grid_hw
+        heat_patch = heat_big[: gh * patch_size, : gw * patch_size].reshape(gh, patch_size, gw, patch_size).mean(axis=(1, 3))
+        row = meta_test.iloc[i]
+        focus_rows.append(_focus_features_from_patch_heat(heat_patch, int(y_test[i]), row, grid_hw, patch_size, cfg, rs))
+
+    out = {"method": "input_grad_x_input_patch_mean", "n_samples": int(n_samples)}
+    out["focus"] = _aggregate_focus_rows(focus_rows)
     return out
 
 
@@ -470,63 +647,11 @@ def _generate_vit_rollout_artifacts(
             heat_big = np.kron(heat, np.ones((patch_size, patch_size), dtype=np.float32))
             heat_big = heat_big[: X_img_test.shape[-2], : X_img_test.shape[-1]]
             dist_rows.append({"label": int(y_test[i]), **attention_distance(mats, patch_size_m=patch_size_m)})
-            # Passer/receiver-centered rollout summary on patch grid.
+            # Passer/receiver/corridor/nearest-def summary on patch grid.
             if meta_test is not None and i < len(meta_test):
                 row = meta_test.iloc[i]
                 rs = _counterfactual_render_spec(cfg)
-                def _patch_focus(x_m: float, y_m: float, radius: int = 1) -> float:
-                    x_px, y_px = meters_to_pixel(float(x_m), float(y_m), rs)
-                    px = int(np.clip(np.floor(x_px / patch_size), 0, grid_hw[1] - 1))
-                    py = int(np.clip(np.floor(y_px / patch_size), 0, grid_hw[0] - 1))
-                    y0 = max(0, py - radius)
-                    y1 = min(grid_hw[0], py + radius + 1)
-                    x0 = max(0, px - radius)
-                    x1 = min(grid_hw[1], px + radius + 1)
-                    patch = heat[y0:y1, x0:x1]
-                    return float(np.mean(patch)) if patch.size else float("nan")
-
-                passer_focus = _patch_focus(row.passer_x_m, row.passer_y_m)
-                receiver_focus = _patch_focus(row.receiver_x_m, row.receiver_y_m)
-                p0_m = np.array([float(row.passer_x_m), float(row.passer_y_m)], dtype=float)
-                p1_m = np.array([float(row.receiver_x_m), float(row.receiver_y_m)], dtype=float)
-
-                # Corridor focus on patch grid centers, using same geometric corridor definition.
-                yy_idx, xx_idx = np.mgrid[0 : grid_hw[0], 0 : grid_hw[1]]
-                x_px_cent = (xx_idx + 0.5) * patch_size
-                y_px_cent = (yy_idx + 0.5) * patch_size
-                x_px_cent = np.clip(x_px_cent, 0, X_img_test.shape[-1] - 1)
-                y_px_cent = np.clip(y_px_cent, 0, X_img_test.shape[-2] - 1)
-                x_m_cent, y_m_cent = _pixel_to_meters(x_px_cent, y_px_cent, rs)
-                patch_pts_m = np.stack([x_m_cent, y_m_cent], axis=-1).reshape(-1, 2)
-                t_patch, d_patch = _line_projection_and_distance(patch_pts_m, p0_m, p1_m)
-                corr_w = float(cfg.get("labeling", {}).get("corridor_w_m", rs.corridor_w_m))
-                corridor_mask = ((t_patch >= 0.0) & (t_patch <= 1.0) & (d_patch <= corr_w)).reshape(grid_hw)
-                if np.any(corridor_mask):
-                    corridor_focus = float(np.nanmean(heat[corridor_mask]))
-                else:
-                    corridor_focus = float("nan")
-
-                # Nearest defender (original frame) focus around patch neighborhood.
-                defenders = _parse_points(getattr(row, "defending_xy_json", ""))
-                nearest_def_focus = float("nan")
-                nearest_def_dist = float("nan")
-                if len(defenders):
-                    t_def, d_def = _line_projection_and_distance(defenders, p0_m, p1_m)
-                    _ = t_def  # projection available if future analysis needs it
-                    idx_near = int(np.argmin(d_def))
-                    nearest_def_dist = float(d_def[idx_near])
-                    nearest_def_focus = _patch_focus(defenders[idx_near, 0], defenders[idx_near, 1])
-                focus_rows.append(
-                    {
-                        "label": int(y_test[i]),
-                        "passer_focus_mean": passer_focus,
-                        "receiver_focus_mean": receiver_focus,
-                        "receiver_minus_passer": receiver_focus - passer_focus,
-                        "corridor_focus_mean": corridor_focus,
-                        "nearest_defender_focus_mean": nearest_def_focus,
-                        "nearest_defender_dist_to_line_m": nearest_def_dist,
-                    }
-                )
+                focus_rows.append(_focus_features_from_patch_heat(heat, int(y_test[i]), row, grid_hw, patch_size, cfg, rs))
         else:
             heat_big = X_img_test[i].max(axis=0)
             heat_big = (heat_big - heat_big.min()) / (heat_big.max() - heat_big.min() + 1e-8)
@@ -548,36 +673,7 @@ def _generate_vit_rollout_artifacts(
         },
     }
     if focus_rows:
-        f_lab = np.array([r["label"] for r in focus_rows], dtype=int)
-        f_p = np.array([r["passer_focus_mean"] for r in focus_rows], dtype=float)
-        f_r = np.array([r["receiver_focus_mean"] for r in focus_rows], dtype=float)
-        f_d = np.array([r["receiver_minus_passer"] for r in focus_rows], dtype=float)
-        f_c = np.array([r.get("corridor_focus_mean", np.nan) for r in focus_rows], dtype=float)
-        f_nd = np.array([r.get("nearest_defender_focus_mean", np.nan) for r in focus_rows], dtype=float)
-
-        def _focus_block(mask: np.ndarray) -> dict[str, Any]:
-            m = np.asarray(mask, dtype=bool)
-            if not np.any(m):
-                return {
-                    "passer_mean": None,
-                    "receiver_mean": None,
-                    "receiver_minus_passer_mean": None,
-                    "corridor_mean": None,
-                    "nearest_defender_mean": None,
-                }
-            return {
-                "passer_mean": float(np.nanmean(f_p[m])),
-                "receiver_mean": float(np.nanmean(f_r[m])),
-                "receiver_minus_passer_mean": float(np.nanmean(f_d[m])),
-                "corridor_mean": float(np.nanmean(f_c[m])),
-                "nearest_defender_mean": float(np.nanmean(f_nd[m])),
-            }
-
-        out["rollout_focus"] = {
-            "label0": _focus_block(f_lab == 0),
-            "label1": _focus_block(f_lab == 1),
-            "overall": _focus_block(np.ones_like(f_lab, dtype=bool)),
-        }
+        out["rollout_focus"] = _aggregate_focus_rows(focus_rows)
     return out
 
 
@@ -757,6 +853,13 @@ def cmd_run(args: argparse.Namespace) -> None:
         cfg=cfg,
         out_dir=paths["figures"],
     )
+    if "resnet18" in metrics["models"]:
+        metrics["explainability"]["resnet18_focus"] = _generate_resnet18_focus_summary(
+            X_img_test=X_img_test,
+            y_test=y_test,
+            meta_test=meta_test.reset_index(drop=True),
+            cfg=cfg,
+        )
 
     # Counterfactual figures for representative samples (first few where constructible).
     n_cf_target = int(cfg.get("eval", {}).get("n_counterfactual_panels", 20))

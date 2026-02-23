@@ -1,0 +1,58 @@
+seed: 42
+pitch:
+  length_m: 105.0
+  width_m: 68.0
+metrica:
+  root_dir: data/external/sample-data
+  fps_default: 25.0
+  sample_games: [1, 2]
+  event_pass_keywords: [pass]
+labeling:
+  min_forward_m: 5.0
+  corridor_w_m: 8.0
+  k_bypassed: 2
+  drop_non_forward: false
+raster:
+  size: 224
+  channels: 7
+  sigma_m: 1.2
+  line_sigma_m: 0.8
+  corridor_w_m: 8.0
+  jitter_m: 0.5
+  y_flip_prob: 0.5
+input:
+  use_channels: [attacking, defending, ball, receiver, pass_line, pass_corridor]
+train:
+  test_size: 0.2
+  val_size: 0.1
+  random_state: 42
+  class_weight: balanced
+  baseline_max_iter: 1000
+  batch_size: 8
+  epochs_stage_a: 2
+  epochs_stage_b: 1
+  lr: 0.0003
+  weight_decay: 0.0001
+  num_workers: 0
+  device: cpu
+  pretrained_backbone: true
+  max_train_samples: 512
+  max_val_samples: 128
+  max_test_samples: 128
+eval:
+  freq_blur_sigma: 2.0
+  counterfactual_shift_m: 10.0
+  counterfactual_distance_bins_m: [0.0, 1.0, 2.0, 4.0, 8.0, 999.0]
+  n_rollout_samples: 8
+  n_freq_panels: 4
+  n_counterfactual_panels: 4
+  threshold_grid_size: 101
+  max_val_threshold_samples: 128
+  max_eval_samples: 128
+  max_counterfactual_eval_samples: 128
+paths:
+  processed_dir: data/processed_linecorridor
+  reports_dir: reports/vit_mid_linecorridor_no_passer
+  figures_dir: reports/vit_mid_linecorridor_no_passer/figures
+  models_dir: reports/vit_mid_linecorridor_no_passer/models
+

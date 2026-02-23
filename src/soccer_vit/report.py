@@ -90,6 +90,13 @@ def _write_summary_md(metrics: dict[str, Any], out_path: Path, n_samples: int) -
                     lines.append(
                         f"- {model_name} CF (orig_label=0) on-line>off-line rate: {neg.get('on_line_greater_rate')}"
                     )
+            by_flip = strat.get("by_label_flip", {})
+            if isinstance(by_flip, dict):
+                flip = by_flip.get("flip")
+                if isinstance(flip, dict):
+                    lines.append(
+                        f"- {model_name} CF (label-flip subset) on-line>off-line rate: {flip.get('on_line_greater_rate')}"
+                    )
     rf = metrics.get("explainability", {}).get("rollout_focus")
     if isinstance(rf, dict):
         o = rf.get("overall", {})
@@ -101,6 +108,23 @@ def _write_summary_md(metrics: dict[str, Any], out_path: Path, n_samples: int) -
                 lines.append(f"- Rollout focus overall (corridor mean): {o.get('corridor_mean')}")
             if o.get("nearest_defender_mean") is not None:
                 lines.append(f"- Rollout focus overall (nearest defender mean): {o.get('nearest_defender_mean')}")
+            if o.get("corridor_to_passer_ratio") is not None:
+                lines.append(f"- Rollout focus overall (corridor/passer ratio): {o.get('corridor_to_passer_ratio')}")
+            if o.get("nearest_defender_to_passer_ratio") is not None:
+                lines.append(
+                    f"- Rollout focus overall (nearest-defender/passer ratio): {o.get('nearest_defender_to_passer_ratio')}"
+                )
+    cnn_focus = metrics.get("explainability", {}).get("resnet18_focus")
+    if isinstance(cnn_focus, dict):
+        cfo = (cnn_focus.get("focus") or {}).get("overall", {})
+        if isinstance(cfo, dict):
+            lines.append(
+                f"- ResNet18 focus proxy overall (receiver-passer mean): {cfo.get('receiver_minus_passer_mean')}"
+            )
+            if cfo.get("corridor_to_passer_ratio") is not None:
+                lines.append(
+                    f"- ResNet18 focus proxy overall (corridor/passer ratio): {cfo.get('corridor_to_passer_ratio')}"
+                )
     lines.append("")
     lines.append("## Models")
     for model, conds in metrics.get("models", {}).items():
