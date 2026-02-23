@@ -76,6 +76,20 @@ def _write_summary_md(metrics: dict[str, Any], out_path: Path, n_samples: int) -
         lines.append(
             f"- {model_name} counterfactual on-line>off-line rate: {cf.get('on_line_greater_rate')}"
         )
+        strat = cf.get("stratified")
+        if isinstance(strat, dict):
+            by_lbl = strat.get("by_orig_label", {})
+            if isinstance(by_lbl, dict):
+                pos = by_lbl.get("1")
+                neg = by_lbl.get("0")
+                if isinstance(pos, dict):
+                    lines.append(
+                        f"- {model_name} CF (orig_label=1) on-line>off-line rate: {pos.get('on_line_greater_rate')}"
+                    )
+                if isinstance(neg, dict):
+                    lines.append(
+                        f"- {model_name} CF (orig_label=0) on-line>off-line rate: {neg.get('on_line_greater_rate')}"
+                    )
     rf = metrics.get("explainability", {}).get("rollout_focus")
     if isinstance(rf, dict):
         o = rf.get("overall", {})
@@ -83,6 +97,10 @@ def _write_summary_md(metrics: dict[str, Any], out_path: Path, n_samples: int) -
             lines.append(
                 f"- Rollout focus overall (receiver-passer mean): {o.get('receiver_minus_passer_mean')}"
             )
+            if o.get("corridor_mean") is not None:
+                lines.append(f"- Rollout focus overall (corridor mean): {o.get('corridor_mean')}")
+            if o.get("nearest_defender_mean") is not None:
+                lines.append(f"- Rollout focus overall (nearest defender mean): {o.get('nearest_defender_mean')}")
     lines.append("")
     lines.append("## Models")
     for model, conds in metrics.get("models", {}).items():

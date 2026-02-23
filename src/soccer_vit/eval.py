@@ -120,6 +120,81 @@ def _parse_points(json_str: str) -> np.ndarray:
     return np.asarray(arr, dtype=np.float32).reshape(-1, 2) if len(arr) else np.zeros((0, 2), dtype=np.float32)
 
 
+def _line_projection_and_distance(points_xy: np.ndarray, p0: np.ndarray, p1: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    pts = np.asarray(points_xy, dtype=float).reshape(-1, 2)
+    if len(pts) == 0:
+        return np.zeros((0,), dtype=float), np.zeros((0,), dtype=float)
+    v = np.asarray(p1, dtype=float) - np.asarray(p0, dtype=float)
+    vv = float(np.dot(v, v))
+    if vv <= 1e-8:
+        d = np.linalg.norm(pts - p0[None, :], axis=1)
+        return np.zeros((len(pts),), dtype=float), d
+    rel = pts - p0[None, :]
+    t = (rel @ v) / vv
+    t_clip = np.clip(t, 0.0, 1.0)
+    proj = p0[None, :] + t_clip[:, None] * v[None, :]
+    d = np.linalg.norm(pts - proj, axis=1)
+    return t, d
+
+
+def _pixel_to_meters(x_px: Any, y_px: Any, spec: RasterSpec) -> tuple[np.ndarray, np.ndarray]:
+    x_arr = np.asarray(x_px, dtype=np.float32)
+    y_arr = np.asarray(y_px, dtype=np.float32)
+    x_m = (x_arr / (spec.size - 1)) * spec.pitch_length_m - spec.pitch_length_m / 2.0
+    y_m = spec.pitch_width_m / 2.0 - (y_arr / (spec.size - 1)) * spec.pitch_width_m
+    return x_m, y_m
+
+
+def _counterfactual_stratified_summary(cf_rows: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]:
+    if not cf_rows:
+        return {}
+    delta = np.asarray([float(r.get("delta_on_minus_off", np.nan)) for r in cf_rows], dtype=float)
+    orig_label = np.asarray([int(r.get("orig_label", 0)) for r in cf_rows], dtype=int)
+    dist = np.asarray([float(r.get("nearest_orig_dist_to_line_m", np.nan)) for r in cf_rows], dtype=float)
+    label_on = np.asarray([int(r.get("label_on_line", 0)) for r in cf_rows], dtype=int)
+    label_off = np.asarray([int(r.get("label_off_line", 0)) for r in cf_rows], dtype=int)
+
+    def _summary(mask: np.ndarray) -> dict[str, Any]:
+        m = np.asarray(mask, dtype=bool)
+        if m.shape[0] != delta.shape[0]:
+            raise ValueError("Mask shape mismatch")
+        if not np.any(m):
+            return {"n": 0}
+        d = delta[m]
+        return {
+            "n": int(np.sum(m)),
+            "mean_delta_on_line_minus_off_line": float(np.nanmean(d)),
+            "median_delta_on_line_minus_off_line": float(np.nanmedian(d)),
+            "on_line_greater_rate": float(np.nanmean(d > 0)),
+            "label_on_line_positive_rate": float(np.mean(label_on[m] == 1)),
+            "label_off_line_positive_rate": float(np.mean(label_off[m] == 1)),
+        }
+
+    out: dict[str, Any] = {
+        "overall": _summary(np.ones_like(orig_label, dtype=bool)),
+        "by_orig_label": {
+            "0": _summary(orig_label == 0),
+            "1": _summary(orig_label == 1),
+        },
+    }
+
+    eval_cfg = cfg.get("eval", {})
+    bins = eval_cfg.get("counterfactual_distance_bins_m", [0.0, 1.0, 2.0, 4.0, 8.0, 1e9])
+    try:
+        bins_f = [float(b) for b in bins]
+    except Exception:
+        bins_f = [0.0, 1.0, 2.0, 4.0, 8.0, 1e9]
+    if len(bins_f) >= 2:
+        rows = []
+        for lo, hi in zip(bins_f[:-1], bins_f[1:]):
+            mask = np.isfinite(dist) & (dist >= lo) & (dist < hi)
+            row = {"bin": f"[{lo},{hi})", "lo": lo, "hi": hi}
+            row.update(_summary(mask))
+            rows.append(row)
+        out["by_nearest_dist_bin_m"] = rows
+    return out
+
+
 def _counterfactual_for_row(meta_row, cfg: dict[str, Any]) -> dict[str, Any]:
     label_cfg = cfg.get("labeling", {})
     params = LineBreakParams(
@@ -412,12 +487,44 @@ def _generate_vit_rollout_artifacts(
 
                 passer_focus = _patch_focus(row.passer_x_m, row.passer_y_m)
                 receiver_focus = _patch_focus(row.receiver_x_m, row.receiver_y_m)
+                p0_m = np.array([float(row.passer_x_m), float(row.passer_y_m)], dtype=float)
+                p1_m = np.array([float(row.receiver_x_m), float(row.receiver_y_m)], dtype=float)
+
+                # Corridor focus on patch grid centers, using same geometric corridor definition.
+                yy_idx, xx_idx = np.mgrid[0 : grid_hw[0], 0 : grid_hw[1]]
+                x_px_cent = (xx_idx + 0.5) * patch_size
+                y_px_cent = (yy_idx + 0.5) * patch_size
+                x_px_cent = np.clip(x_px_cent, 0, X_img_test.shape[-1] - 1)
+                y_px_cent = np.clip(y_px_cent, 0, X_img_test.shape[-2] - 1)
+                x_m_cent, y_m_cent = _pixel_to_meters(x_px_cent, y_px_cent, rs)
+                patch_pts_m = np.stack([x_m_cent, y_m_cent], axis=-1).reshape(-1, 2)
+                t_patch, d_patch = _line_projection_and_distance(patch_pts_m, p0_m, p1_m)
+                corr_w = float(cfg.get("labeling", {}).get("corridor_w_m", rs.corridor_w_m))
+                corridor_mask = ((t_patch >= 0.0) & (t_patch <= 1.0) & (d_patch <= corr_w)).reshape(grid_hw)
+                if np.any(corridor_mask):
+                    corridor_focus = float(np.nanmean(heat[corridor_mask]))
+                else:
+                    corridor_focus = float("nan")
+
+                # Nearest defender (original frame) focus around patch neighborhood.
+                defenders = _parse_points(getattr(row, "defending_xy_json", ""))
+                nearest_def_focus = float("nan")
+                nearest_def_dist = float("nan")
+                if len(defenders):
+                    t_def, d_def = _line_projection_and_distance(defenders, p0_m, p1_m)
+                    _ = t_def  # projection available if future analysis needs it
+                    idx_near = int(np.argmin(d_def))
+                    nearest_def_dist = float(d_def[idx_near])
+                    nearest_def_focus = _patch_focus(defenders[idx_near, 0], defenders[idx_near, 1])
                 focus_rows.append(
                     {
                         "label": int(y_test[i]),
                         "passer_focus_mean": passer_focus,
                         "receiver_focus_mean": receiver_focus,
                         "receiver_minus_passer": receiver_focus - passer_focus,
+                        "corridor_focus_mean": corridor_focus,
+                        "nearest_defender_focus_mean": nearest_def_focus,
+                        "nearest_defender_dist_to_line_m": nearest_def_dist,
                     }
                 )
         else:
@@ -445,22 +552,31 @@ def _generate_vit_rollout_artifacts(
         f_p = np.array([r["passer_focus_mean"] for r in focus_rows], dtype=float)
         f_r = np.array([r["receiver_focus_mean"] for r in focus_rows], dtype=float)
         f_d = np.array([r["receiver_minus_passer"] for r in focus_rows], dtype=float)
+        f_c = np.array([r.get("corridor_focus_mean", np.nan) for r in focus_rows], dtype=float)
+        f_nd = np.array([r.get("nearest_defender_focus_mean", np.nan) for r in focus_rows], dtype=float)
+
+        def _focus_block(mask: np.ndarray) -> dict[str, Any]:
+            m = np.asarray(mask, dtype=bool)
+            if not np.any(m):
+                return {
+                    "passer_mean": None,
+                    "receiver_mean": None,
+                    "receiver_minus_passer_mean": None,
+                    "corridor_mean": None,
+                    "nearest_defender_mean": None,
+                }
+            return {
+                "passer_mean": float(np.nanmean(f_p[m])),
+                "receiver_mean": float(np.nanmean(f_r[m])),
+                "receiver_minus_passer_mean": float(np.nanmean(f_d[m])),
+                "corridor_mean": float(np.nanmean(f_c[m])),
+                "nearest_defender_mean": float(np.nanmean(f_nd[m])),
+            }
+
         out["rollout_focus"] = {
-            "label0": {
-                "passer_mean": float(np.nanmean(f_p[f_lab == 0])) if np.any(f_lab == 0) else None,
-                "receiver_mean": float(np.nanmean(f_r[f_lab == 0])) if np.any(f_lab == 0) else None,
-                "receiver_minus_passer_mean": float(np.nanmean(f_d[f_lab == 0])) if np.any(f_lab == 0) else None,
-            },
-            "label1": {
-                "passer_mean": float(np.nanmean(f_p[f_lab == 1])) if np.any(f_lab == 1) else None,
-                "receiver_mean": float(np.nanmean(f_r[f_lab == 1])) if np.any(f_lab == 1) else None,
-                "receiver_minus_passer_mean": float(np.nanmean(f_d[f_lab == 1])) if np.any(f_lab == 1) else None,
-            },
-            "overall": {
-                "passer_mean": float(np.nanmean(f_p)),
-                "receiver_mean": float(np.nanmean(f_r)),
-                "receiver_minus_passer_mean": float(np.nanmean(f_d)),
-            },
+            "label0": _focus_block(f_lab == 0),
+            "label1": _focus_block(f_lab == 1),
+            "overall": _focus_block(np.ones_like(f_lab, dtype=bool)),
         }
     return out
 
@@ -562,6 +678,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 "on_line_greater_rate": float(np.mean(delta > 0)),
                 "expected_direction": "on_line > off_line for geometry line-break label",
             }
+            metrics["counterfactual"][model_name]["stratified"] = _counterfactual_stratified_summary(cf_rows, cfg)
             import pandas as pd
 
             pd.DataFrame(cf_rows).to_csv(paths["reports"] / f"counterfactual_{model_name}.csv", index=False)
@@ -627,6 +744,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                     "on_line_greater_rate": float(np.mean(delta > 0)),
                     "expected_direction": "on_line > off_line for geometry line-break label",
                 }
+                metrics["counterfactual"][model_name]["stratified"] = _counterfactual_stratified_summary(cf_rows, cfg)
                 import pandas as pd
 
                 pd.DataFrame(cf_rows).to_csv(paths["reports"] / f"counterfactual_{model_name}.csv", index=False)
