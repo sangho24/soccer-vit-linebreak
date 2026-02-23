@@ -14,14 +14,14 @@ labeling:
   drop_non_forward: false
 raster:
   size: 224
-  channels: 5
+  channels: 7
   sigma_m: 1.2
   line_sigma_m: 0.8
   corridor_w_m: 8.0
   jitter_m: 0.5
   y_flip_prob: 0.5
 input:
-  use_channels: [attacking, defending, ball, passer, receiver]
+  use_channels: [attacking, defending, ball, passer, receiver, pass_line, pass_corridor]
 train:
   test_size: 0.2
   val_size: 0.1
@@ -50,7 +50,7 @@ eval:
   max_eval_samples: 128
   max_counterfactual_eval_samples: 128
 paths:
-  processed_dir: data/processed
-  reports_dir: reports/vit_mid
-  figures_dir: reports/vit_mid/figures
-  models_dir: reports/vit_mid/models
+  processed_dir: data/processed_linecorridor
+  reports_dir: reports/vit_mid_linecorridor
+  figures_dir: reports/vit_mid_linecorridor/figures
+  models_dir: reports/vit_mid_linecorridor/models

@@ -26,6 +26,8 @@ def _plot_metric_bars(metrics: dict[str, Any], fig_path: Path) -> None:
         for cond, vals in conds.items():
             if not isinstance(vals, dict):
                 continue
+            if not {"auroc", "f1", "balanced_accuracy"}.issubset(vals.keys()):
+                continue
             rows.append((model, cond, vals.get("auroc"), vals.get("f1"), vals.get("balanced_accuracy")))
     if not rows:
         return
@@ -58,6 +60,15 @@ def _write_summary_md(metrics: dict[str, Any], out_path: Path, n_samples: int) -
     if art:
         lines.append(f"- Generated frequency triplet panels: {art.get('freq_triplets', 0)}")
         lines.append(f"- Generated counterfactual panels: {art.get('counterfactual_panels', 0)}")
+    conds_top = metrics.get("conditions", {})
+    if isinstance(conds_top, dict):
+        ch = conds_top.get("selected_channels")
+        if ch:
+            lines.append(f"- Selected channels: {', '.join(map(str, ch))}")
+        if conds_top.get("eval_n_val_for_threshold") is not None:
+            lines.append(
+                f"- Val samples for threshold tuning: {conds_top.get('eval_n_val_for_threshold')}"
+            )
     cf_map = metrics.get("counterfactual", {})
     for model_name, cf in cf_map.items():
         if not isinstance(cf, dict):
@@ -79,9 +90,24 @@ def _write_summary_md(metrics: dict[str, Any], out_path: Path, n_samples: int) -
         for cond, vals in conds.items():
             if not isinstance(vals, dict):
                 continue
+            if not {"auroc", "f1", "balanced_accuracy"}.issubset(vals.keys()):
+                continue
             lines.append(
                 f"- {cond}: AUROC={vals.get('auroc')} F1={vals.get('f1')} BalancedAcc={vals.get('balanced_accuracy')}"
             )
+        tt = conds.get("threshold_tuning") if isinstance(conds, dict) else None
+        if isinstance(tt, dict):
+            for objective in ["best_f1", "best_balanced_accuracy"]:
+                entry = tt.get(objective)
+                if not isinstance(entry, dict):
+                    continue
+                thr = entry.get("threshold")
+                tmo = entry.get("test_metrics", {}).get("original", {})
+                if isinstance(tmo, dict):
+                    lines.append(
+                        f"- threshold_tuning/{objective}: thr={thr} "
+                        f"test(original) F1={tmo.get('f1')} BalancedAcc={tmo.get('balanced_accuracy')} AUROC={tmo.get('auroc')}"
+                    )
         lines.append("")
     out_path.write_text("\n".join(lines), encoding="utf-8")
 

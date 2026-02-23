@@ -113,6 +113,8 @@ def _build_dataset_from_games(cfg: dict[str, Any]) -> tuple[dict[str, np.ndarray
     raster = RasterSpec(
         size=int(raster_cfg.get("size", 224)),
         sigma_m=float(raster_cfg.get("sigma_m", 1.2)),
+        line_sigma_m=float(raster_cfg.get("line_sigma_m", 0.8)),
+        corridor_w_m=float(raster_cfg.get("corridor_w_m", params.corridor_w_m)),
         pitch_length_m=pitch.length_m,
         pitch_width_m=pitch.width_m,
         channels=int(raster_cfg.get("channels", 5)),

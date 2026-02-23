@@ -9,6 +9,7 @@ __pycache__/
 
 data/external/
 data/processed/
+data/processed_*/
 
 reports/**
 !reports/

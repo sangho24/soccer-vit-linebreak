@@ -4,14 +4,14 @@ from typing import Any
 
 import numpy as np
 
-CHANNEL_ORDER = ["attacking", "defending", "ball", "passer", "receiver"]
+CHANNEL_ORDER = ["attacking", "defending", "ball", "passer", "receiver", "pass_line", "pass_corridor"]
 
 
 def resolve_channel_selection(cfg: dict[str, Any], n_available: int = 5) -> tuple[list[int], list[str]]:
     """Resolve channel subset from config.
 
     Supported config shapes:
-    - input.use_channels: [attacking, defending, ball, passer, receiver]
+    - input.use_channels: [attacking, defending, ball, passer, receiver, pass_line, pass_corridor]
     - input.include_ball / input.include_passer / input.include_receiver (bool)
     Defaults to all available channels in CHANNEL_ORDER order.
     """
@@ -46,4 +46,3 @@ def select_image_channels(images: np.ndarray, cfg: dict[str, Any]) -> tuple[np.n
         raise ValueError(f"Expected images as NCHW, got shape {images.shape}")
     idx, names = resolve_channel_selection(cfg, n_available=int(images.shape[1]))
     return images[:, idx, :, :], names
-

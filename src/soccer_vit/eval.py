@@ -10,7 +10,7 @@ import numpy as np
 from .data_pipeline import load_saved_dataset
 from .input_channels import select_image_channels
 from .labeling.linebreak import LineBreakParams, compute_baseline_features, label_line_break
-from .metrics import binary_metrics, nan_to_none
+from .metrics import binary_metrics, find_best_thresholds, nan_to_none
 from .models.baselines import load_baseline
 from .raster.augment import high_pass, low_pass
 from .raster.render import RasterSpec, meters_to_pixel, render_snapshot
@@ -53,6 +53,30 @@ def _subsample_eval_indices(idx: np.ndarray, y_all: np.ndarray, max_n: int | Non
         extra = rng.choice(remaining, size=min(max_n - len(chosen), len(remaining)), replace=False)
         chosen = np.concatenate([chosen, extra])
     return np.sort(chosen)
+
+
+def _compute_threshold_tuning_summary(
+    y_val: np.ndarray,
+    p_val: np.ndarray,
+    y_test: np.ndarray,
+    p_test_by_condition: dict[str, np.ndarray],
+    n_grid: int = 101,
+) -> dict[str, Any]:
+    best = find_best_thresholds(y_val, p_val, n_grid=n_grid)
+    if not best:
+        return {}
+    out: dict[str, Any] = {"grid_size": int(n_grid)}
+    for objective, info in best.items():
+        thr = float(info["threshold"])
+        cond_metrics = {}
+        for cond, p_test in p_test_by_condition.items():
+            cond_metrics[cond] = binary_metrics(y_test, p_test, threshold=thr)
+        out[objective] = {
+            "threshold": thr,
+            "val_metrics": info["val_metrics"],
+            "test_metrics": cond_metrics,
+        }
+    return out
 
 
 def _predict_torch(model_name: str, images: np.ndarray, cfg: dict[str, Any]) -> np.ndarray | None:  # pragma: no cover - torch dependent
@@ -225,6 +249,8 @@ def _counterfactual_render_spec(cfg: dict[str, Any]) -> RasterSpec:
     return RasterSpec(
         size=int(raster_cfg.get("size", 224)),
         sigma_m=float(raster_cfg.get("sigma_m", 1.2)),
+        line_sigma_m=float(raster_cfg.get("line_sigma_m", 0.8)),
+        corridor_w_m=float(raster_cfg.get("corridor_w_m", cfg.get("labeling", {}).get("corridor_w_m", 8.0))),
         pitch_length_m=float(pitch_cfg.get("length_m", 105.0)),
         pitch_width_m=float(pitch_cfg.get("width_m", 68.0)),
         channels=int(raster_cfg.get("channels", 5)),
@@ -445,18 +471,31 @@ def cmd_run(args: argparse.Namespace) -> None:
     ensure_dirs(paths["reports"], paths["figures"])
     arrays, meta = load_saved_dataset(cfg)
     splits = _load_splits(paths["processed"])
-    te_idx = splits["test_idx"]
     eval_cfg = cfg.get("eval", {})
+    te_idx = splits["test_idx"]
     te_idx = _subsample_eval_indices(
         te_idx,
         arrays["labels"].astype(int),
         eval_cfg.get("max_eval_samples"),
         seed=int(cfg.get("seed", 42)) + 99,
     )
+    va_idx = splits["val_idx"] if len(splits["val_idx"]) else splits["test_idx"]
+    va_idx = _subsample_eval_indices(
+        va_idx,
+        arrays["labels"].astype(int),
+        eval_cfg.get("max_val_threshold_samples"),
+        seed=int(cfg.get("seed", 42)) + 100,
+    )
+    y_val = arrays["labels"][va_idx].astype(int)
     y_test = arrays["labels"][te_idx].astype(int)
+    X_feat_val = arrays["features"][va_idx]
     X_feat_test = arrays["features"][te_idx]
+    X_img_val_full = arrays["images"][va_idx]
     X_img_test_full = arrays["images"][te_idx]
+    X_img_val, selected_channels_val = select_image_channels(X_img_val_full, cfg)
     X_img_test, selected_channels = select_image_channels(X_img_test_full, cfg)
+    if selected_channels_val != selected_channels:
+        raise RuntimeError("Channel selection mismatch between val and test subsets")
     sample_ids_all = arrays.get("sample_ids")
     if sample_ids_all is not None and len(sample_ids_all) == len(arrays["labels"]):
         sample_ids_test = sample_ids_all[te_idx]
@@ -466,8 +505,10 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     metrics: dict[str, Any] = {"models": {}, "conditions": {}, "counterfactual": {}}
     metrics["conditions"]["eval_n_test"] = int(len(te_idx))
+    metrics["conditions"]["eval_n_val_for_threshold"] = int(len(va_idx))
     metrics["conditions"]["selected_channels"] = selected_channels
     metrics["conditions"]["counterfactual_eval_n"] = int(cfg.get("eval", {}).get("max_counterfactual_eval_samples", len(te_idx)))
+    metrics["conditions"]["threshold_grid_size"] = int(eval_cfg.get("threshold_grid_size", 101))
 
     feature_names_dataset = [str(x) for x in arrays.get("feature_names", [])]
     cf_rows_shared, cf_images_shared = _build_counterfactual_rows_and_images(meta_test, cfg)
@@ -477,12 +518,23 @@ def cmd_run(args: argparse.Namespace) -> None:
         baseline = load_baseline(bpath)
         feat_names = list(getattr(baseline, "feature_names", []) or feature_names_dataset)
         feat_idx = [feature_names_dataset.index(f) for f in feat_names]
+        Xb_val = X_feat_val[:, feat_idx]
         Xb = X_feat_test[:, feat_idx]
+        p_val = baseline.predict_proba(Xb_val)
         p_orig = baseline.predict_proba(Xb)
         metrics["models"][model_name] = {"original": nan_to_none(binary_metrics(y_test, p_orig))}
         # Frequency perturbs do not alter baseline features; log identical values for comparability.
         metrics["models"][model_name]["low_pass"] = metrics["models"][model_name]["original"]
         metrics["models"][model_name]["high_pass"] = metrics["models"][model_name]["original"]
+        metrics["models"][model_name]["threshold_tuning"] = nan_to_none(
+            _compute_threshold_tuning_summary(
+                y_val=y_val,
+                p_val=p_val,
+                y_test=y_test,
+                p_test_by_condition={"original": p_orig, "low_pass": p_orig, "high_pass": p_orig},
+                n_grid=int(eval_cfg.get("threshold_grid_size", 101)),
+            )
+        )
 
         cf_rows = []
         for r in cf_rows_shared:
@@ -520,6 +572,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     # Evaluate available image models under original/low/high perturbations.
     for model_name in ["resnet18", "vit_base"]:
+        p_val = _predict_torch(model_name, X_img_val, cfg)
         p_orig = _predict_torch(model_name, X_img_test, cfg)
         if p_orig is None:
             continue
@@ -532,6 +585,20 @@ def cmd_run(args: argparse.Namespace) -> None:
             "low_pass": nan_to_none(binary_metrics(y_test, p_low)) if p_low is not None else None,
             "high_pass": nan_to_none(binary_metrics(y_test, p_high)) if p_high is not None else None,
         }
+        if p_val is not None:
+            metrics["models"][model_name]["threshold_tuning"] = nan_to_none(
+                _compute_threshold_tuning_summary(
+                    y_val=y_val,
+                    p_val=p_val,
+                    y_test=y_test,
+                    p_test_by_condition={
+                        "original": p_orig,
+                        "low_pass": p_low if p_low is not None else p_orig,
+                        "high_pass": p_high if p_high is not None else p_orig,
+                    },
+                    n_grid=int(eval_cfg.get("threshold_grid_size", 101)),
+                )
+            )
         # Counterfactual probability shift for image models (same geometry manipulations rendered as raster).
         if cf_rows_shared and cf_images_shared:
             X_cf_on, _ = select_image_channels(cf_images_shared["on_line"], cfg)
