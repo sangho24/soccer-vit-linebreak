@@ -1,0 +1,50 @@
+seed: 42
+pitch:
+  length_m: 105.0
+  width_m: 68.0
+metrica:
+  root_dir: data/external/sample-data
+  fps_default: 25.0
+  sample_games: [1, 2]
+  event_pass_keywords: [pass]
+labeling:
+  min_forward_m: 5.0
+  corridor_w_m: 8.0
+  k_bypassed: 2
+  drop_non_forward: false
+raster:
+  size: 224
+  channels: 5
+  sigma_m: 1.2
+  jitter_m: 0.5
+  y_flip_prob: 0.5
+train:
+  test_size: 0.2
+  val_size: 0.1
+  random_state: 42
+  class_weight: balanced
+  baseline_max_iter: 1000
+  batch_size: 32
+  epochs_stage_a: 5
+  epochs_stage_b: 5
+  lr: 0.0003
+  weight_decay: 0.0001
+  num_workers: 0
+  device: auto
+eval:
+  freq_blur_sigma: 2.0
+  counterfactual_shift_m: 10.0
+  n_rollout_samples: 30
+paths:
+  processed_dir: data/processed
+  reports_dir: reports
+  figures_dir: reports/figures
+  models_dir: reports/models
+# Smoke overrides
+
+eval:
+  freq_blur_sigma: 2.0
+  counterfactual_shift_m: 10.0
+  n_rollout_samples: 5
+  n_freq_panels: 3
+  n_counterfactual_panels: 3
