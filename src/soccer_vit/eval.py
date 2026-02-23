@@ -309,6 +309,43 @@ def _aggregate_focus_rows(focus_rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _save_explainability_samples_npz(
+    out_path: Path,
+    heat_patches: list[np.ndarray],
+    y_labels: list[int],
+    sample_ids: list[str],
+    meta_rows: list[dict[str, float]],
+    patch_size: int,
+    grid_hw: tuple[int, int],
+    method: str,
+) -> None:
+    if not heat_patches:
+        return
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    hp = np.stack([np.asarray(h, dtype=np.float32) for h in heat_patches], axis=0)
+    labels = np.asarray(y_labels, dtype=np.int64)
+    sids = np.asarray(sample_ids, dtype=object)
+    def _col(name: str) -> np.ndarray:
+        return np.asarray([float(r.get(name, np.nan)) for r in meta_rows], dtype=np.float32)
+    np.savez_compressed(
+        out_path,
+        heat_patches=hp,
+        labels=labels,
+        sample_ids=sids,
+        passer_x_m=_col("passer_x_m"),
+        passer_y_m=_col("passer_y_m"),
+        receiver_x_m=_col("receiver_x_m"),
+        receiver_y_m=_col("receiver_y_m"),
+        nearest_def_x_m=_col("nearest_def_x_m"),
+        nearest_def_y_m=_col("nearest_def_y_m"),
+        nearest_def_dist_to_line_m=_col("nearest_def_dist_to_line_m"),
+        patch_size=np.asarray([int(patch_size)], dtype=np.int32),
+        grid_h=np.asarray([int(grid_hw[0])], dtype=np.int32),
+        grid_w=np.asarray([int(grid_hw[1])], dtype=np.int32),
+        method=np.asarray([str(method)], dtype=object),
+    )
+
+
 def _generate_resnet18_focus_summary(
     X_img_test: np.ndarray,
     y_test: np.ndarray,
@@ -343,6 +380,10 @@ def _generate_resnet18_focus_summary(
     grid_hw = (X_img_test.shape[-2] // patch_size, X_img_test.shape[-1] // patch_size)
     rs = _counterfactual_render_spec(cfg)
     focus_rows = []
+    heat_patches: list[np.ndarray] = []
+    heat_sample_ids: list[str] = []
+    heat_labels: list[int] = []
+    heat_meta: list[dict[str, float]] = []
     for i in range(n_samples):
         xb = torch.tensor(X_img_test[i : i + 1], dtype=torch.float32, requires_grad=True)
         logits = model(xb)
@@ -366,9 +407,45 @@ def _generate_resnet18_focus_summary(
         heat_patch = heat_big[: gh * patch_size, : gw * patch_size].reshape(gh, patch_size, gw, patch_size).mean(axis=(1, 3))
         row = meta_test.iloc[i]
         focus_rows.append(_focus_features_from_patch_heat(heat_patch, int(y_test[i]), row, grid_hw, patch_size, cfg, rs))
+        defenders = _parse_points(getattr(row, "defending_xy_json", ""))
+        nearest_def_x = np.nan
+        nearest_def_y = np.nan
+        nearest_def_d = np.nan
+        if len(defenders):
+            p0_m = np.array([float(row.passer_x_m), float(row.passer_y_m)], dtype=float)
+            p1_m = np.array([float(row.receiver_x_m), float(row.receiver_y_m)], dtype=float)
+            _, d_def = _line_projection_and_distance(defenders, p0_m, p1_m)
+            idx_near = int(np.argmin(d_def))
+            nearest_def_x = float(defenders[idx_near, 0])
+            nearest_def_y = float(defenders[idx_near, 1])
+            nearest_def_d = float(d_def[idx_near])
+        heat_patches.append(heat_patch.astype(np.float32))
+        heat_sample_ids.append(str(getattr(row, "sample_id", i)))
+        heat_labels.append(int(y_test[i]))
+        heat_meta.append(
+            {
+                "passer_x_m": float(row.passer_x_m),
+                "passer_y_m": float(row.passer_y_m),
+                "receiver_x_m": float(row.receiver_x_m),
+                "receiver_y_m": float(row.receiver_y_m),
+                "nearest_def_x_m": nearest_def_x,
+                "nearest_def_y_m": nearest_def_y,
+                "nearest_def_dist_to_line_m": nearest_def_d,
+            }
+        )
 
     out = {"method": "input_grad_x_input_patch_mean", "n_samples": int(n_samples)}
     out["focus"] = _aggregate_focus_rows(focus_rows)
+    _save_explainability_samples_npz(
+        out_path=_paths(cfg)["reports"] / "resnet18_focus_samples.npz",
+        heat_patches=heat_patches,
+        y_labels=heat_labels,
+        sample_ids=heat_sample_ids,
+        meta_rows=heat_meta,
+        patch_size=patch_size,
+        grid_hw=grid_hw,
+        method="input_grad_x_input_patch_mean",
+    )
     return out
 
 
@@ -635,6 +712,10 @@ def _generate_vit_rollout_artifacts(
 
     dist_rows = []
     focus_rows = []
+    heat_patches: list[np.ndarray] = []
+    heat_sample_ids: list[str] = []
+    heat_labels: list[int] = []
+    heat_meta: list[dict[str, float]] = []
     for i in range(n_samples):
         xb = torch.tensor(X_img_test[i : i + 1], dtype=torch.float32)
         with ViTAttentionExtractor(model) as cap:
@@ -652,6 +733,32 @@ def _generate_vit_rollout_artifacts(
                 row = meta_test.iloc[i]
                 rs = _counterfactual_render_spec(cfg)
                 focus_rows.append(_focus_features_from_patch_heat(heat, int(y_test[i]), row, grid_hw, patch_size, cfg, rs))
+                defenders = _parse_points(getattr(row, "defending_xy_json", ""))
+                nearest_def_x = np.nan
+                nearest_def_y = np.nan
+                nearest_def_d = np.nan
+                if len(defenders):
+                    p0_m = np.array([float(row.passer_x_m), float(row.passer_y_m)], dtype=float)
+                    p1_m = np.array([float(row.receiver_x_m), float(row.receiver_y_m)], dtype=float)
+                    _, d_def = _line_projection_and_distance(defenders, p0_m, p1_m)
+                    idx_near = int(np.argmin(d_def))
+                    nearest_def_x = float(defenders[idx_near, 0])
+                    nearest_def_y = float(defenders[idx_near, 1])
+                    nearest_def_d = float(d_def[idx_near])
+                heat_patches.append(heat.astype(np.float32))
+                heat_sample_ids.append(str(sample_ids_test[i]))
+                heat_labels.append(int(y_test[i]))
+                heat_meta.append(
+                    {
+                        "passer_x_m": float(row.passer_x_m),
+                        "passer_y_m": float(row.passer_y_m),
+                        "receiver_x_m": float(row.receiver_x_m),
+                        "receiver_y_m": float(row.receiver_y_m),
+                        "nearest_def_x_m": nearest_def_x,
+                        "nearest_def_y_m": nearest_def_y,
+                        "nearest_def_dist_to_line_m": nearest_def_d,
+                    }
+                )
         else:
             heat_big = X_img_test[i].max(axis=0)
             heat_big = (heat_big - heat_big.min()) / (heat_big.max() - heat_big.min() + 1e-8)
@@ -674,6 +781,16 @@ def _generate_vit_rollout_artifacts(
     }
     if focus_rows:
         out["rollout_focus"] = _aggregate_focus_rows(focus_rows)
+    _save_explainability_samples_npz(
+        out_path=_paths(cfg)["reports"] / "vit_rollout_samples.npz",
+        heat_patches=heat_patches,
+        y_labels=heat_labels,
+        sample_ids=heat_sample_ids,
+        meta_rows=heat_meta,
+        patch_size=patch_size,
+        grid_hw=grid_hw,
+        method="vit_cls_rollout_patch_heat",
+    )
     return out
 
 
