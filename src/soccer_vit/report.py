@@ -113,6 +113,43 @@ def _nan_min_max(arrs: list[np.ndarray], default: tuple[float, float] = (0.0, 1.
     return float(np.min(cat)), float(np.max(cat))
 
 
+PASTEL_THEME: dict[str, str] = {
+    "bg": "#f8fafc",
+    "grid": "#cbd5e1",
+    "text": "#334155",
+    "both": "#a9def9",
+    "no_passer": "#f7c8e0",
+    "overall": "#a9def9",
+    "flip": "#fbd1a2",
+    "resnet18": "#b8e1dd",
+    "vit_base": "#f9d29d",
+    "line_only": "#cdeac0",
+    "corridor_only": "#e9c7d8",
+    "both_role": "#c7d9f2",
+    "budget_passer": "#a9def9",
+    "budget_receiver": "#c2f0c2",
+    "budget_corridor": "#fbd1a2",
+    "budget_nearest": "#f7c8e0",
+    "metric_auroc": "#a9def9",
+    "metric_f1": "#c2f0c2",
+    "metric_cf_rate": "#fbd1a2",
+    "metric_cf_flip": "#f7c8e0",
+    "focus_rp": "#b8e1dd",
+    "focus_cp": "#f9d29d",
+    "focus_ndp": "#d7c4f3",
+    "all_points": "#94a3b8",
+}
+
+
+def _apply_axis_style(ax, *, with_y_grid: bool = True) -> None:
+    ax.set_facecolor(PASTEL_THEME["bg"])
+    if with_y_grid:
+        ax.grid(axis="y", alpha=0.35, linestyle="--", linewidth=0.7, color=PASTEL_THEME["grid"])
+    ax.tick_params(colors=PASTEL_THEME["text"])
+    for spine in ax.spines.values():
+        spine.set_color("#c9d3e1")
+
+
 def _add_bar_value_labels(ax, bar_container, nd: int = 3, fontsize: int = 8) -> None:
     for rect in bar_container:
         h = float(rect.get_height())
@@ -214,37 +251,62 @@ def _plot_q1_no_passer(
             }
         )
     fig, axes = plt.subplots(1, 3, figsize=(15.2, 4.5))
+    fig.patch.set_facecolor("white")
+    for ax in axes:
+        _apply_axis_style(ax)
     labels = ["AUROC", "F1", "CF rate", "CF delta"]
     x = np.arange(len(labels))
     width = 0.35
+    run_colors = {
+        "both": PASTEL_THEME["both"],
+        "no_passer": PASTEL_THEME["no_passer"],
+    }
     for j, row in enumerate(rows):
         vals = [row[k] if row[k] is not None else 0.0 for k in labels]
-        bars = axes[0].bar(x + (j - 0.5) * width, vals, width=width, label=row["name"])
+        bars = axes[0].bar(
+            x + (j - 0.5) * width,
+            vals,
+            width=width,
+            label=row["name"],
+            color=run_colors.get(row["name"], PASTEL_THEME["both"]),
+            edgecolor="#7b8799",
+            linewidth=0.6,
+        )
         _add_bar_value_labels(axes[0], bars, nd=3, fontsize=7)
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(labels, rotation=15)
     axes[0].set_title("Q1: no_passer vs both (performance + CF)")
-    axes[0].legend()
+    axes[0].legend(loc="upper right", frameon=True, fontsize=8)
     axes[0].set_ylim(min(-0.1, np.nanmin([r["CF delta"] or 0 for r in rows]) - 0.05), 1.0)
-    axes[0].grid(axis="y", alpha=0.2)
 
     labels2 = ["Receiver-Passer", "Corridor/Passer", "NearestDef/Passer"]
     x2 = np.arange(len(labels2))
     for j, row in enumerate(rows):
         vals = [row[k] if row[k] is not None else 0.0 for k in labels2]
-        bars = axes[1].bar(x2 + (j - 0.5) * width, vals, width=width, label=row["name"])
+        bars = axes[1].bar(
+            x2 + (j - 0.5) * width,
+            vals,
+            width=width,
+            label=row["name"],
+            color=run_colors.get(row["name"], PASTEL_THEME["both"]),
+            edgecolor="#7b8799",
+            linewidth=0.6,
+        )
         _add_bar_value_labels(axes[1], bars, nd=2, fontsize=7)
-    axes[1].axhline(0, color="black", lw=0.8)
+    axes[1].axhline(0, color="#475569", lw=0.8)
     axes[1].set_xticks(x2)
     axes[1].set_xticklabels(labels2, rotation=20)
     axes[1].set_title("Q1: focus balance (ViT rollout)")
-    axes[1].legend()
-    axes[1].grid(axis="y", alpha=0.2)
 
     # Attention budget view: normalize positive focus means into a 100% stacked bar.
     budget_parts = ["passer_mean", "receiver_mean", "corridor_mean", "nearest_defender_mean"]
     budget_labels = ["Passer", "Receiver", "Corridor", "NearestDef"]
-    budget_colors = ["#1f77b4", "#2ca02c", "#ff7f0e", "#d62728"]
+    budget_colors = [
+        PASTEL_THEME["budget_passer"],
+        PASTEL_THEME["budget_receiver"],
+        PASTEL_THEME["budget_corridor"],
+        PASTEL_THEME["budget_nearest"],
+    ]
     x3 = np.arange(len(rows))
     bottoms = np.zeros(len(rows), dtype=float)
     for key, lbl, col in zip(budget_parts, budget_labels, budget_colors):
@@ -254,10 +316,10 @@ def _plot_q1_no_passer(
             dtype=float,
         )
         pct = np.divide(vals, totals, out=np.zeros_like(vals), where=totals > 1e-12)
-        axes[2].bar(x3, pct, bottom=bottoms, label=lbl, color=col, width=0.6)
+        axes[2].bar(x3, pct, bottom=bottoms, label=lbl, color=col, width=0.6, edgecolor="#7b8799", linewidth=0.5)
         for i, p in enumerate(pct):
             if p >= 0.12:
-                axes[2].text(i, bottoms[i] + p / 2.0, f"{p*100:.0f}%", ha="center", va="center", fontsize=7, color="white")
+                axes[2].text(i, bottoms[i] + p / 2.0, f"{p*100:.0f}%", ha="center", va="center", fontsize=7, color="#1f2937")
         bottoms += pct
     axes[2].set_ylim(0, 1)
     axes[2].set_yticks(np.linspace(0, 1, 6))
@@ -265,8 +327,7 @@ def _plot_q1_no_passer(
     axes[2].set_xticks(x3)
     axes[2].set_xticklabels([r["name"] for r in rows])
     axes[2].set_title("Q1: focus budget (100% stacked)")
-    axes[2].legend(fontsize=8, loc="upper right")
-    axes[2].grid(axis="y", alpha=0.2)
+    axes[2].legend(fontsize=8, loc="upper right", frameon=True)
 
     both = next((r for r in rows if r["name"] == "both"), None)
     nop = next((r for r in rows if r["name"] == "no_passer"), None)
@@ -319,75 +380,183 @@ def _plot_q2_counterfactual_flip(compare_metrics: dict[str, Any], out_path: Path
     cf_csv_rows = {m: _load_counterfactual_csv_rows(compare_report_dir, m) for m in models} if compare_report_dir else {}
     has_dot_panel = any(cf_csv_rows.get(m) for m in models)
     ncols = 3 if has_dot_panel else 2
-    fig, axes = plt.subplots(1, ncols, figsize=(15.2 if has_dot_panel else 10.8, 4.6))
+
+    fig_w = 15.6 if has_dot_panel else 11.2
+    fig, axes = plt.subplots(
+        1,
+        ncols,
+        figsize=(fig_w, 4.9),
+        gridspec_kw={"width_ratios": [1.05, 1.05, 1.2]} if has_dot_panel else None,
+    )
     if ncols == 2:
         axes = np.asarray(axes, dtype=object)
+    fig.patch.set_facecolor("white")
+    for ax in axes:
+        _apply_axis_style(ax)
+
+    colors = {
+        "overall": PASTEL_THEME["overall"],
+        "flip": PASTEL_THEME["flip"],
+        "resnet18": PASTEL_THEME["resnet18"],
+        "vit_base": PASTEL_THEME["vit_base"],
+        "all_points": PASTEL_THEME["all_points"],
+    }
+    display_names = {"resnet18": "ResNet18", "vit_base": "ViT-Base"}
+
+    def _annotate_bars(ax, bars, nd: int, y_pad_ratio: float = 0.02) -> None:
+        ymin, ymax = ax.get_ylim()
+        yr = max(1e-8, ymax - ymin)
+        for rect in bars:
+            h = float(rect.get_height())
+            if not np.isfinite(h):
+                continue
+            x = float(rect.get_x() + rect.get_width() / 2.0)
+            y = h + y_pad_ratio * yr if h >= 0 else h - y_pad_ratio * yr
+            y = min(y, ymax - 0.02 * yr) if h >= 0 else max(y, ymin + 0.02 * yr)
+            ax.text(
+                x,
+                y,
+                f"{h:.{nd}f}",
+                ha="center",
+                va="bottom" if h >= 0 else "top",
+                fontsize=8,
+                color="#1f2937",
+            )
+
     x = np.arange(len(rows))
     width = 0.36
-    bars0 = axes[0].bar(x - width / 2, [r["overall_rate"] or 0 for r in rows], width=width, label="overall")
-    bars1 = axes[0].bar(x + width / 2, [r["flip_rate"] or 0 for r in rows], width=width, label="label-flip subset")
-    _add_bar_value_labels(axes[0], bars0, nd=3, fontsize=7)
-    _add_bar_value_labels(axes[0], bars1, nd=3, fontsize=7)
+    bars0 = axes[0].bar(
+        x - width / 2,
+        [r["overall_rate"] or 0 for r in rows],
+        width=width,
+        label="overall",
+        color=colors["overall"],
+        edgecolor="#7b8799",
+        linewidth=0.6,
+    )
+    bars1 = axes[0].bar(
+        x + width / 2,
+        [r["flip_rate"] or 0 for r in rows],
+        width=width,
+        label="label-flip subset",
+        color=colors["flip"],
+        edgecolor="#7b8799",
+        linewidth=0.6,
+    )
     axes[0].set_xticks(x)
-    axes[0].set_xticklabels([r["model"] for r in rows])
-    axes[0].set_ylim(0, 1)
-    axes[0].set_title("Q2: Counterfactual on-line > off-line rate")
-    axes[0].legend()
-    axes[0].grid(axis="y", alpha=0.2)
-    for i, r in enumerate(rows):
-        if r["flip_n"] is not None:
-            axes[0].text(i + width / 2, min(0.98, (r["flip_rate"] or 0) + 0.06), f"flip n={r['flip_n']}", ha="center", fontsize=8)
+    axes[0].set_xticklabels([display_names.get(r["model"], r["model"]) for r in rows])
+    axes[0].set_ylim(0, 1.12)
+    axes[0].set_title("On-line > Off-line Rate", fontsize=12, pad=8)
+    axes[0].set_ylabel("Proportion")
+    _annotate_bars(axes[0], bars0, nd=3)
+    _annotate_bars(axes[0], bars1, nd=3)
 
-    bars2 = axes[1].bar(x - width / 2, [r["overall_delta"] or 0 for r in rows], width=width, label="overall")
-    bars3 = axes[1].bar(x + width / 2, [r["flip_delta"] or 0 for r in rows], width=width, label="label-flip subset")
-    _add_bar_value_labels(axes[1], bars2, nd=3, fontsize=7)
-    _add_bar_value_labels(axes[1], bars3, nd=3, fontsize=7)
-    axes[1].axhline(0, color="black", lw=0.8)
+    bars2 = axes[1].bar(
+        x - width / 2,
+        [r["overall_delta"] or 0 for r in rows],
+        width=width,
+        label="overall",
+        color=colors["overall"],
+        edgecolor="#7b8799",
+        linewidth=0.6,
+    )
+    bars3 = axes[1].bar(
+        x + width / 2,
+        [r["flip_delta"] or 0 for r in rows],
+        width=width,
+        label="label-flip subset",
+        color=colors["flip"],
+        edgecolor="#7b8799",
+        linewidth=0.6,
+    )
+    axes[1].axhline(0, color="#364152", lw=0.9)
     axes[1].set_xticks(x)
-    axes[1].set_xticklabels([r["model"] for r in rows])
-    axes[1].set_title("Q2: Counterfactual ΔP(on-off)")
-    axes[1].legend()
-    axes[1].grid(axis="y", alpha=0.2)
+    axes[1].set_xticklabels([display_names.get(r["model"], r["model"]) for r in rows])
+    delta_vals = np.asarray([r["overall_delta"] or 0.0 for r in rows] + [r["flip_delta"] or 0.0 for r in rows], dtype=float)
+    dmax = float(np.max(np.abs(delta_vals))) if delta_vals.size else 0.1
+    dmax = max(0.05, dmax * 1.35)
+    axes[1].set_ylim(-dmax * 0.25, dmax)
+    axes[1].set_title("Mean ΔP (on-line - off-line)", fontsize=12, pad=8)
+    axes[1].set_ylabel("Probability shift")
+    _annotate_bars(axes[1], bars2, nd=3)
+    _annotate_bars(axes[1], bars3, nd=3)
 
     if has_dot_panel:
         ax = axes[2]
-        ax.axhline(0, color="black", lw=0.8)
-        colors = {"resnet18": "tab:blue", "vit_base": "tab:orange"}
+        ax.axhline(0, color="#364152", lw=0.9)
         for i, model in enumerate(models):
             model_rows = cf_csv_rows.get(model, [])
             deltas = np.asarray([r.get("delta_on_minus_off", np.nan) for r in model_rows], dtype=float)
             if deltas.size == 0:
                 continue
             flip = np.asarray([bool(r.get("is_label_flip")) if r.get("is_label_flip") is not None else False for r in model_rows], dtype=bool)
-            jitter = np.linspace(-0.12, 0.12, len(deltas)) if len(deltas) > 1 else np.array([0.0], dtype=float)
+            rng = np.random.default_rng(42 + i)
+            jitter = rng.uniform(-0.14, 0.14, size=len(deltas)) if len(deltas) > 1 else np.array([0.0], dtype=float)
             xj = i + jitter
-            ax.scatter(xj, deltas, s=22, alpha=0.45, color="0.65", label="all samples" if i == 0 else None)
+            ax.scatter(
+                xj,
+                deltas,
+                s=24,
+                alpha=0.40,
+                color=colors["all_points"],
+                label="all samples" if i == 0 else None,
+                linewidths=0,
+            )
             if np.any(flip):
-                ax.scatter(xj[flip], deltas[flip], s=30, alpha=0.9, color=colors[model], edgecolor="black", linewidth=0.3, label="label-flip subset" if i == 0 else None)
+                ax.scatter(
+                    xj[flip],
+                    deltas[flip],
+                    s=34,
+                    alpha=0.92,
+                    color=colors[model],
+                    edgecolor="#111827",
+                    linewidth=0.35,
+                    label="label-flip subset" if i == 0 else None,
+                )
             mu = float(np.nanmean(deltas)) if np.any(np.isfinite(deltas)) else np.nan
             if np.isfinite(mu):
-                ax.scatter([i], [mu], s=60, marker="D", color=colors[model], edgecolor="black", linewidth=0.5, zorder=4)
-            ax.text(i, ax.get_ylim()[1] if np.isfinite(ax.get_ylim()[1]) else 0.0, "", alpha=0.0)  # keep autoscale stable before annotations
-            ax.text(
-                i,
-                np.nanmax(deltas[np.isfinite(deltas)]) + 0.01 if np.any(np.isfinite(deltas)) else 0.02,
-                f"n={len(deltas)}, flip={int(np.sum(flip))}",
-                ha="center",
-                va="bottom",
-                fontsize=8,
-            )
+                ax.scatter([i], [mu], s=64, marker="D", color=colors[model], edgecolor="#111827", linewidth=0.55, zorder=4)
         ax.set_xticks(np.arange(len(models)))
-        ax.set_xticklabels(models)
-        ax.set_title("Q2: Sample-level ΔP (local geometric intervention)")
+        ax.set_xticklabels([display_names.get(m, m) for m in models])
+        ax.set_title("Sample-level ΔP Distribution", fontsize=12, pad=8)
         ax.set_ylabel("ΔP(on-line - off-line)")
-        ax.grid(axis="y", alpha=0.2)
-        ax.legend(fontsize=8, loc="best")
+        ax.legend(fontsize=8, loc="upper left", frameon=True)
 
-    flip_ns = [r.get("flip_n") for r in rows if r.get("flip_n") is not None]
-    flip_n_note = f"label-flip subset n per model: {flip_ns}" if flip_ns else "label-flip subset n unavailable"
-    fig.subplots_adjust(left=0.06, right=0.99, top=0.90, bottom=0.24, wspace=0.28)
-    fig.text(0.01, 0.05, "Counterfactual here is a local geometric intervention (nearest-defender on-line vs off-line), not a full tactical counterfactual.", ha="left", va="bottom", fontsize=8)
-    fig.text(0.01, 0.02, f"Small-n caveat: {flip_n_note}. Interpret flip-subset magnitudes as structure-sensitivity sanity checks.", ha="left", va="bottom", fontsize=8)
+    for ax in axes:
+        ax.tick_params(axis="x", labelsize=10)
+        ax.tick_params(axis="y", labelsize=10)
+
+    legend_handles = [bars0[0], bars1[0]]
+    legend_labels = ["overall", "label-flip subset"]
+    fig.legend(
+        legend_handles,
+        legend_labels,
+        ncol=2,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.985),
+        frameon=True,
+        fontsize=10,
+    )
+    fig.suptitle("Q2. Counterfactual Response to Local Geometric Intervention", fontsize=15, y=1.03)
+    fig.subplots_adjust(left=0.06, right=0.99, top=0.82, bottom=0.22, wspace=0.30)
+    fig.text(
+        0.01,
+        0.055,
+        "Counterfactual is a local geometric intervention (nearest defender moved on-line vs off-line), not a full tactical reconstruction.",
+        ha="left",
+        va="bottom",
+        fontsize=8,
+        color="#374151",
+    )
+    fig.text(
+        0.01,
+        0.02,
+        "Small-n caveat: interpret label-flip subset effect size as a structure-sensitivity sanity check.",
+        ha="left",
+        va="bottom",
+        fontsize=8,
+        color="#374151",
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -428,7 +597,10 @@ def _plot_q3_role_map(metrics_map: dict[str, dict[str, Any]], out_path: Path) ->
     mat_norm = (mat - mn) / den
 
     fig, axes = plt.subplots(1, 2, figsize=(12.2, 4.8))
-    im = axes[0].imshow(mat_norm, cmap="viridis", aspect="auto", vmin=0, vmax=1)
+    fig.patch.set_facecolor("white")
+    _apply_axis_style(axes[0], with_y_grid=False)
+    _apply_axis_style(axes[1], with_y_grid=True)
+    im = axes[0].imshow(mat_norm, cmap="PuBuGn", aspect="auto", vmin=0, vmax=1)
     axes[0].set_xticks(np.arange(len(metrics_names)))
     axes[0].set_xticklabels(metrics_names, rotation=25, ha="right")
     axes[0].set_yticks(np.arange(len(rows)))
@@ -436,7 +608,8 @@ def _plot_q3_role_map(metrics_map: dict[str, dict[str, Any]], out_path: Path) ->
     axes[0].set_title("Q3: Role heatmap (column-normalized background, raw values annotated)")
     for i in range(mat.shape[0]):
         for j in range(mat.shape[1]):
-            axes[0].text(j, i, f"{mat[i,j]:.2f}", ha="center", va="center", color="white", fontsize=8)
+            txt_color = "white" if mat_norm[i, j] >= 0.55 else PASTEL_THEME["text"]
+            axes[0].text(j, i, f"{mat[i,j]:.2f}", ha="center", va="center", color=txt_color, fontsize=8)
     fig.colorbar(im, ax=axes[0], fraction=0.046, pad=0.04)
     axes[0].text(
         0.01,
@@ -450,7 +623,19 @@ def _plot_q3_role_map(metrics_map: dict[str, dict[str, Any]], out_path: Path) ->
 
     x = np.array([r["AUROC"] for r in rows], dtype=float)
     y = np.array([r["CF_flip_rate"] for r in rows], dtype=float)
-    axes[1].scatter(x, y, s=80, c=["tab:blue", "tab:orange", "tab:green"])
+    run_colors = {
+        "line_only": PASTEL_THEME["line_only"],
+        "corridor_only": PASTEL_THEME["corridor_only"],
+        "both": PASTEL_THEME["both_role"],
+    }
+    axes[1].scatter(
+        x,
+        y,
+        s=88,
+        c=[run_colors.get(r["run"], PASTEL_THEME["both_role"]) for r in rows],
+        edgecolors="#6b7280",
+        linewidths=0.7,
+    )
     text_offsets = {
         "line_only": (0.004, 0.015),
         "corridor_only": (-0.035, -0.035),
@@ -463,14 +648,14 @@ def _plot_q3_role_map(metrics_map: dict[str, dict[str, Any]], out_path: Path) ->
             yi + dy,
             r["run"],
             fontsize=9,
-            bbox={"boxstyle": "round,pad=0.15", "facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+            color=PASTEL_THEME["text"],
+            bbox={"boxstyle": "round,pad=0.15", "facecolor": "white", "alpha": 0.9, "edgecolor": "#cbd5e1"},
         )
     axes[1].set_xlim(max(0, np.nanmin(x) - 0.05), min(1.0, np.nanmax(x) + 0.08))
     axes[1].set_ylim(0, 1.02)
     axes[1].set_xlabel("Discrimination (AUROC)")
     axes[1].set_ylabel("Structure sensitivity (CF flip-subset rate)")
     axes[1].set_title("Q3: Channel role map")
-    axes[1].grid(alpha=0.2)
     axes[1].text(
         0.02,
         0.02,
@@ -516,52 +701,95 @@ def _plot_q4_compare_focus(compare_metrics: dict[str, Any], out_path: Path) -> b
                 "NearestDef/Passer": _safe_float(rf.get("nearest_defender_to_passer_ratio")) or 0.0,
             }
         )
-    fig, axes = plt.subplots(1, 2, figsize=(12.2, 4.8))
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 5.2))
+    fig.patch.set_facecolor("white")
+    _apply_axis_style(axes[0], with_y_grid=True)
+    _apply_axis_style(axes[1], with_y_grid=True)
     x = np.arange(len(rows))
     width = 0.18
     perf_cols = ["AUROC", "F1", "CF rate", "CF flip"]
-    for j, col in enumerate(perf_cols):
-        bars = axes[0].bar(x + (j - 1.5) * width, [r[col] for r in rows], width=width, label=col)
+    perf_colors = [
+        PASTEL_THEME["metric_auroc"],
+        PASTEL_THEME["metric_f1"],
+        PASTEL_THEME["metric_cf_rate"],
+        PASTEL_THEME["metric_cf_flip"],
+    ]
+    perf_handles = []
+    for j, (col, c) in enumerate(zip(perf_cols, perf_colors)):
+        bars = axes[0].bar(
+            x + (j - 1.5) * width,
+            [r[col] for r in rows],
+            width=width,
+            label=col,
+            color=c,
+            edgecolor="#7b8799",
+            linewidth=0.6,
+        )
         _add_bar_value_labels(axes[0], bars, nd=3, fontsize=7)
+        perf_handles.append(bars[0])
     axes[0].set_xticks(x)
-    axes[0].set_xticklabels([r["model"] for r in rows])
-    axes[0].set_ylim(0, 1)
+    axes[0].set_xticklabels(["ResNet18", "ViT-Base"])
+    axes[0].set_ylim(0, 1.10)
     axes[0].set_title("Q4: CNN vs ViT (performance + counterfactual)")
-    axes[0].legend(fontsize=8)
-    axes[0].grid(axis="y", alpha=0.2)
 
     focus_cols = ["Receiver-Passer", "Corridor/Passer", "NearestDef/Passer"]
     width2 = 0.22
-    for j, col in enumerate(focus_cols):
-        bars = axes[1].bar(x + (j - 1) * width2, [r[col] for r in rows], width=width2, label=col)
+    focus_colors = [PASTEL_THEME["focus_rp"], PASTEL_THEME["focus_cp"], PASTEL_THEME["focus_ndp"]]
+    focus_handles = []
+    for j, (col, c) in enumerate(zip(focus_cols, focus_colors)):
+        bars = axes[1].bar(
+            x + (j - 1) * width2,
+            [r[col] for r in rows],
+            width=width2,
+            label=col,
+            color=c,
+            edgecolor="#7b8799",
+            linewidth=0.6,
+        )
         _add_bar_value_labels(axes[1], bars, nd=2, fontsize=7)
-    axes[1].axhline(0, color="black", lw=0.8)
+        focus_handles.append(bars[0])
+    axes[1].axhline(0, color="#475569", lw=0.8)
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(
-        ["resnet18\n(proxy saliency)" if r["model"] == "resnet18" else "vit_base\n(attn rollout)" for r in rows],
+        ["ResNet18\n(proxy saliency)" if r["model"] == "resnet18" else "ViT-Base\n(attn rollout)" for r in rows],
         fontsize=8,
     )
     axes[1].set_title("Q4: Common focus metrics")
-    axes[1].legend(fontsize=8)
-    axes[1].grid(axis="y", alpha=0.2)
-    axes[1].text(
-        0.02,
-        0.02,
-        "Receiver-Passer > 0: receiver-focused\nCorridor/Passer or NearestDef/Passer > 1: structure region exceeds passer focus",
-        transform=axes[1].transAxes,
+    # Keep legends out of data region.
+    fig.legend(
+        perf_handles,
+        perf_cols,
+        fontsize=8.5,
+        frameon=True,
+        ncol=4,
+        loc="upper left",
+        bbox_to_anchor=(0.055, 0.955),
+    )
+    fig.legend(
+        focus_handles,
+        focus_cols,
+        fontsize=8.5,
+        frameon=True,
+        ncol=3,
+        loc="upper right",
+        bbox_to_anchor=(0.975, 0.955),
+    )
+    fig.tight_layout(rect=[0, 0.12, 1, 0.88])
+    fig.text(
+        0.01,
+        0.055,
+        "Focus metric guide: Receiver-Passer > 0 => receiver-focused | Corridor/Passer or NearestDef/Passer > 1 => structure-region focus exceeds passer.",
         ha="left",
         va="bottom",
-        fontsize=8,
-        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.8, "edgecolor": "0.8"},
+        fontsize=8.5,
     )
-    fig.tight_layout(rect=[0, 0.08, 1, 1])
     fig.text(
         0.01,
         0.02,
         "ResNet18 focus uses input_grad * input patch-mean saliency proxy (not Grad-CAM).",
         ha="left",
         va="bottom",
-        fontsize=8,
+        fontsize=8.5,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
