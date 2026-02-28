@@ -13,7 +13,7 @@ Metrica sample-data 기반으로 line-breaking pass 라벨을 geometry 규칙으
 - 해석: attention rollout, attention distance, focus metrics, counterfactual (local geometric intervention)
 - 리포트: 질문형(Q1~Q4) figure 자동 생성 + pass-centric heatmap 비교
 
-## 2) 핵심 결과 스냅샷 (발표용)
+## 2) 핵심 결과 스냅샷
 
 - 데이터셋: `N=1759`, `pos_rate≈0.151`
 - 7채널 성능:
@@ -136,7 +136,7 @@ eval:
   explainability_export_n: 128
 ```
 
-## 11) 체크포인트/산출물 트러블슈팅 (중요)
+## 11) 체크포인트/산출물 트러블슈팅
 
 `eval` 실행 후 `metrics.json`에 `models: {}` / `counterfactual: {}`만 나오고 아래 파일이 없으면, 거의 항상 체크포인트 누락입니다.
 
